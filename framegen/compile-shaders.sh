@@ -15,9 +15,22 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 command -v glslangValidator >/dev/null || { echo "glslangValidator was not found" >&2; exit 2; }
 mkdir -p "$here/src/shaders"
-for source in "$here/shaders/"*.comp; do
+sources=("$here/shaders/"*.comp)
+if (( $# )); then
+    sources=()
+    for name in "$@"; do sources+=("$here/shaders/$name.comp"); done
+fi
+for source in "${sources[@]}"; do
     name=$(basename "$source" .comp)
     glslangValidator -V --target-env vulkan1.3 "$source" -o "$source.spv" > /dev/null
     glslangValidator -V --target-env vulkan1.3 --vn "fg_spv_$name" "$source" -o "$here/src/shaders/$name.comp.h" > /dev/null
     echo "$name: $source.spv, src/shaders/$name.comp.h"
+    if [[ $name == nn_final ]]; then
+        for format in rgb10_a2 rgba16f; do
+            variant="${name}_${format}"
+            glslangValidator -V --target-env vulkan1.3 -DOUTPUT_FORMAT="$format" "$source" -o "$here/shaders/$variant.comp.spv" > /dev/null
+            glslangValidator -V --target-env vulkan1.3 -DOUTPUT_FORMAT="$format" --vn "fg_spv_$variant" "$source" -o "$here/src/shaders/$variant.comp.h" > /dev/null
+            echo "$variant: $variant.comp.spv, src/shaders/$variant.comp.h"
+        done
+    fi
 done

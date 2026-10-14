@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "framegen.h"
+#include "fg_neural.h"
 
 #include <cmath>
 #include <cstdio>
@@ -54,6 +55,8 @@ static fg_create_info valid_info()
 	info.height = 2160;
 	info.slots = 2;
 	info.output_format = VK_FORMAT_R8G8B8A8_UNORM;
+	info.get_device_proc_addr = vkGetDeviceProcAddr;
+	info.get_memory_properties = vkGetPhysicalDeviceMemoryProperties;
 	return info;
 }
 
@@ -89,6 +92,81 @@ static void test_create_info()
 	CHECK(fg_context_create(&info, &ctx, error, sizeof(error)) != VK_SUCCESS);
 	CHECK(ctx == nullptr);
 	CHECK(std::strstr(error, "slots") != nullptr);
+}
+
+static PFN_vkVoidFunction VKAPI_CALL missing_device_proc(VkDevice, const char *)
+{
+	return nullptr;
+}
+
+static std::vector<uint32_t> test_weights()
+{
+	// One scale-1 block, width 4, two hidden layers, radius 0; all weights are zero.
+	std::vector<uint32_t> weights{ 0x31574746, 1, 1, 4, 2, 0 };
+	const uint32_t layers[][3] = { { 8, 4, 1 }, { 4, 4, 1 }, { 4, 5, 0 } };
+	for (const auto &layer : layers) {
+		weights.insert(weights.end(), layer, layer + 3);
+		const uint32_t ig = (layer[0] + 3) / 4, og = (layer[1] + 3) / 4;
+		weights.resize(weights.size() + og * 9 * ig * 16 + og * 4);
+	}
+	return weights;
+}
+
+static void test_external_dispatch()
+{
+	fg_create_info info = valid_info();
+	info.get_device_proc_addr = nullptr;
+	fg_context *ctx = nullptr;
+	char error[256] = "";
+	CHECK(fg_context_create(&info, &ctx, error, sizeof(error)) != VK_SUCCESS);
+	CHECK(ctx == nullptr);
+	CHECK(std::strstr(error, "get_device_proc_addr") != nullptr);
+	info.get_device_proc_addr = missing_device_proc;
+	CHECK(fg_context_create(&info, &ctx, error, sizeof(error)) != VK_SUCCESS);
+	CHECK(ctx == nullptr);
+	CHECK(std::strstr(error, "vkAllocateDescriptorSets") != nullptr);
+
+	const std::vector<uint32_t> weights = test_weights();
+	const size_t bytes = weights.size() * sizeof(uint32_t);
+	fg_neural_info neural{};
+	neural.device = info.device;
+	neural.physical_device = reinterpret_cast<VkPhysicalDevice>(static_cast<uintptr_t>(1));
+	neural.width = neural.height = 64;
+	neural.slots = 1;
+	neural.get_memory_properties = vkGetPhysicalDeviceMemoryProperties;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "get_device_proc_addr") != nullptr);
+	neural.get_device_proc_addr = missing_device_proc;
+	neural.output_format = VK_FORMAT_B8G8R8A8_UNORM;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "output format") != nullptr);
+	neural.output_format = VK_FORMAT_UNDEFINED;
+	neural.hdr10 = true;
+	neural.source_width = neural.source_height = 32;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "pixel art") != nullptr);
+	neural.source_width = neural.source_height = 0;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "vkAllocateDescriptorSets") != nullptr);
+	CHECK(fg_neural_create(nullptr, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	CHECK(fg_neural_create(&neural, nullptr, bytes, error, sizeof(error)) == nullptr);
+	neural.width = 0;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	neural.width = 64;
+	neural.slots = 9;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	neural.slots = 1;
+	neural.get_memory_properties = nullptr;
+	CHECK(fg_neural_create(&neural, weights.data(), bytes, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "get_memory_properties") != nullptr);
+	neural.get_memory_properties = vkGetPhysicalDeviceMemoryProperties;
+	CHECK(fg_neural_create(&neural, weights.data(), 0, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "magic") != nullptr);
+	const uint32_t empty_weights[] = { 0x31574746, 0 };
+	CHECK(fg_neural_create(&neural, empty_weights, sizeof(empty_weights), error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "blocks") != nullptr);
+	CHECK(fg_neural_create(&neural, weights.data(), bytes - 4, error, sizeof(error)) == nullptr);
+	CHECK(std::strstr(error, "truncated") != nullptr);
 }
 
 static void test_psnr()
@@ -146,6 +224,7 @@ int main(int argc, char **argv)
 	}
 	test_method_names();
 	test_create_info();
+	test_external_dispatch();
 	test_psnr();
 	test_embedded_spirv(argv[1]);
 	std::printf("framegen host tests: %d checks, %d failed\n", checks, failures);

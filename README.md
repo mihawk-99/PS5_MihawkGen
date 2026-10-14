@@ -109,6 +109,46 @@ tools/lab.sh host               # a minute: FrameGen Lab on this PC's Vulkan dri
 
 Judge quality on the PC and the PS5; judge speed only on the PS5.
 
+### Embedding the neural backend
+
+`framegen/src/fg_neural.h` is the standalone colour-only interface. Compile
+`fg_neural.cpp` with the headers in `framegen/include/`; it does not link to a
+Vulkan loader. Supply the embedding device's `get_device_proc_addr` and physical
+device's `get_memory_properties` callbacks in `fg_neural_info`. The optional
+allocation callbacks must remain valid until destruction. Creation owns the
+network resources; the caller owns command submission, input/output images,
+their outer barriers, and the lifetime of each slot.
+
+Inputs may use any floating-point sampled format supported by the device,
+including `VK_FORMAT_A2B10G10R10_UNORM_PACK32` and
+`VK_FORMAT_R16G16B16A16_SFLOAT`. `output_format` selects RGBA8 (also the default),
+A2B10G10R10, or RGBA16F storage. The caller must enable/check the appropriate
+Vulkan format and storage-image features. No formatless storage feature is
+required. The older multi-method context and its baseline shaders remain
+RGBA8-only; its other methods still use the application's Vulkan loader.
+
+Set `hdr10 = true` only for ST 2084 PQ / BT.2020 inputs. This uses a fixed
+203-nit luminance shoulder and perceptual encoding for the SDR-trained network
+and still/HUD decisions, while preserving the original PQ colour values in the
+generated image. RGBA16F output is **PQ stored in floats, not linear scRGB**.
+This option does not retrain the model, map the displayed image, or promise HDR
+motion quality. Pixel-art motion is not supported with this option. With it
+disabled the original SDR shader calculations are unchanged. Schedule each
+desired interpolation time through `fg_frame_pair::t` between zero and one.
+
+```bash
+framegen/compile-shaders.sh nn_downsample nn_final
+python3 framegen/tests/check_neural_formats.py
+```
+
+The GPU test builds the pre-change revision `bb45cf1c536996e0bfc295ca91a2896e54d2c44f`
+from local git history and compares nine SDR outputs byte-for-byte on the same
+device. It also reads back HDR10 still/HUD detail and highlights using ten-bit
+and half-float storage, including three caller-scheduled times. It requires
+C++20, Python 3.12+, `pkg-config vulkan`, and a Vulkan device; the synthetic
+64-row test working size is not a PS5 performance or game-quality benchmark.
+
+
 ## Training
 
 The network is weights only (432,308 parameters, 1.7 MB): no image, clip or game file is in this repository or in the weights, and the network cannot paint a picture that is not in its input. The trainer in `train/` takes any folder of clips, so you can retrain on material of your own choosing. The research models used for comparison (GIMM-VFI, BiM-VFI, AMT) are for non-commercial measurement only and are not part of the weights.

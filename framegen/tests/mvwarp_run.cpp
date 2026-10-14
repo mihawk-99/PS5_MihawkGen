@@ -127,7 +127,9 @@ int main(int argc, char **argv)
 	Img motion = makeImage(VK_FORMAT_R16G16_SFLOAT, sampled);
 	Img out = makeImage(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
-	const fg_create_info info{ .device = device, .physical_device = physical, .width = width, .height = height, .slots = 1, .output_format = VK_FORMAT_R8G8B8A8_UNORM };
+	const fg_create_info info{ .device = device, .physical_device = physical, .width = width, .height = height, .slots = 1,
+		.output_format = VK_FORMAT_R8G8B8A8_UNORM, .get_device_proc_addr = vkGetDeviceProcAddr,
+		.get_memory_properties = vkGetPhysicalDeviceMemoryProperties };
 	fg_context *ctx = nullptr;
 	char error[256];
 	VK(fg_context_create(&info, &ctx, error, sizeof(error)));

@@ -223,7 +223,8 @@ static bool make_target(vk_framegen *fg, Target &t, unsigned w, unsigned h)
 static bool make_resources(vk_framegen *fg, unsigned w, unsigned h, unsigned source_w, unsigned source_h)
 {
 	destroy_resources(fg);
-	const fg_create_info info{ fg->device, fg->gpu, w, h, fg->slots, VK_FORMAT_R8G8B8A8_UNORM, source_w, source_h };
+	const fg_create_info info{ fg->device, fg->gpu, w, h, fg->slots, VK_FORMAT_R8G8B8A8_UNORM, source_w, source_h,
+		vkGetDeviceProcAddr, vkGetPhysicalDeviceMemoryProperties, nullptr, false };
 	char error[256] = "";
 	if (fg_context_create(&info, &fg->ctx, error, sizeof(error)) != VK_SUCCESS) {
 		RARCH_ERR("[FrameGen] %s\n", error);

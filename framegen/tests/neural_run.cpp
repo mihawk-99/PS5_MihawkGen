@@ -1,9 +1,12 @@
 /*
- * PS5_FrameGen - runs the neural method on a PC's Vulkan device, headless: two RGBA8
- * frames and a weight file in, the generated frame out. train/parity.py compares it with
- * the network in PyTorch; the same program times the passes (GPU timestamps).
+ * PS5_FrameGen - runs the standalone neural method on a Vulkan device, headless:
+ * two colour frames and a weight file in, the generated frame out. train/parity.py
+ * compares it with the network in PyTorch; GPU timestamps time each run.
  *
  *   neural_run WEIGHTS FRAME0.rgba FRAME1.rgba WIDTH HEIGHT T OUTPUT.rgba [REPEATS]
+ * FG_INPUT_FORMAT / FG_OUTPUT_FORMAT: rgba8 (default), rgb10_a2, rgba16f.
+ * FG_HDR10=1: PQ/BT.2020 analysis; float images still carry PQ, not scRGB.
+ * FG_LEGACY_CONTEXT is only for check_neural_formats.py's pre-change comparison.
  *
  * Copyright (C) 2026 Mihawk
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -16,6 +19,19 @@
 #include <vector>
 
 #include "framegen.h"
+#ifndef FG_LEGACY_CONTEXT
+#include "fg_neural.h"
+#endif
+
+static VkFormat frameFormat(const char *name)
+{
+	const char *value = std::getenv(name);
+	if (!value || !std::strcmp(value, "rgba8")) return VK_FORMAT_R8G8B8A8_UNORM;
+	if (!std::strcmp(value, "rgb10_a2")) return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+	if (!std::strcmp(value, "rgba16f")) return VK_FORMAT_R16G16B16A16_SFLOAT;
+	std::fprintf(stderr, "invalid %s: %s\n", name, value);
+	std::exit(2);
+}
 
 #define VK(call)                                                          \
 	do {                                                                  \
@@ -47,20 +63,30 @@ int main(int argc, char **argv)
 	const int repeats = argc > 8 ? atoi(argv[8]) : 1;
 	const std::vector<char> weights = slurp(argv[1]);
 	const std::vector<char> frames[2] = { slurp(argv[2]), slurp(argv[3]) };
-	const size_t bytes = size_t(width) * height * 4;
+	const VkFormat inputFormat = frameFormat("FG_INPUT_FORMAT"), outputFormat = frameFormat("FG_OUTPUT_FORMAT");
+	const size_t bytes = size_t(width) * height * (inputFormat == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4);
+	const size_t outputBytes = size_t(width) * height * (outputFormat == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4);
 	if (frames[0].size() != bytes || frames[1].size() != bytes) {
 		std::fprintf(stderr, "frames must be %zu bytes\n", bytes);
 		return 2;
 	}
 
 	const VkApplicationInfo app{ .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3 };
+#ifdef __APPLE__
+	const char *instanceExtensions[] = { VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME };
+	const VkInstanceCreateInfo instInfo{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR, .pApplicationInfo = &app,
+		.enabledExtensionCount = 1, .ppEnabledExtensionNames = instanceExtensions };
+#else
 	const VkInstanceCreateInfo instInfo{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+#endif
 	VkInstance instance;
 	VK(vkCreateInstance(&instInfo, nullptr, &instance));
 	uint32_t count = 0;
 	VK(vkEnumeratePhysicalDevices(instance, &count, nullptr));
 	std::vector<VkPhysicalDevice> devices(count);
 	VK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
+	if (!count) { std::fprintf(stderr, "no Vulkan device\n"); return 1; }
 	VkPhysicalDevice physical = devices[0];
 	const char *want = std::getenv("FG_DEVICE");
 	for (VkPhysicalDevice dev : devices) {
@@ -83,7 +109,18 @@ int main(int argc, char **argv)
 	}
 	const float priority = 1.0f;
 	const VkDeviceQueueCreateInfo queueInfo{ .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
-	const VkDeviceCreateInfo devInfo{ .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo };
+	VkPhysicalDeviceFeatures features{};
+	vkGetPhysicalDeviceFeatures(physical, &features);
+	VkPhysicalDeviceFeatures enabled{};
+	enabled.shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats;
+#ifdef __APPLE__
+	const char *deviceExtensions[] = { "VK_KHR_portability_subset" };
+	const VkDeviceCreateInfo devInfo{ .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo,
+		.enabledExtensionCount = 1, .ppEnabledExtensionNames = deviceExtensions, .pEnabledFeatures = &enabled };
+#else
+	const VkDeviceCreateInfo devInfo{ .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo,
+		.pEnabledFeatures = &enabled };
+#endif
 	VkDevice device;
 	VK(vkCreateDevice(physical, &devInfo, nullptr, &device));
 	VkQueue queue;
@@ -99,9 +136,9 @@ int main(int argc, char **argv)
 		std::exit(1);
 	};
 	struct Img { VkImage image; VkDeviceMemory mem; VkImageView view; };
-	auto makeImage = [&](VkImageUsageFlags usage) {
+	auto makeImage = [&](VkImageUsageFlags usage, VkFormat format) {
 		Img img{};
-		const VkImageCreateInfo info{ .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+		const VkImageCreateInfo info{ .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = format,
 			.extent = { width, height, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
 			.usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
 		VK(vkCreateImage(device, &info, nullptr, &img.image));
@@ -111,7 +148,7 @@ int main(int argc, char **argv)
 		VK(vkAllocateMemory(device, &ai, nullptr, &img.mem));
 		VK(vkBindImageMemory(device, img.image, img.mem, 0));
 		const VkImageViewCreateInfo vi{ .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img.image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-			.format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+			.format = format, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
 		VK(vkCreateImageView(device, &vi, nullptr, &img.view));
 		return img;
 	};
@@ -130,10 +167,12 @@ int main(int argc, char **argv)
 		VK(vkMapMemory(device, b.mem, 0, VK_WHOLE_SIZE, 0, &b.mapped));
 		return b;
 	};
-	Img in[2] = { makeImage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT), makeImage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) };
-	Img out = makeImage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-	Buf staging = makeBuffer(bytes);
+	Img in[2] = { makeImage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, inputFormat),
+		makeImage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, inputFormat) };
+	Img out = makeImage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, outputFormat);
+	Buf staging = makeBuffer(bytes > outputBytes ? bytes : outputBytes);
 
+#ifdef FG_LEGACY_CONTEXT
 	const fg_create_info info{ .device = device, .physical_device = physical, .width = width, .height = height, .slots = 1,
 		.output_format = VK_FORMAT_R8G8B8A8_UNORM,
 		.source_width = getenv("FG_SOURCE") ? uint32_t(atoi(getenv("FG_SOURCE"))) : 0u,       // pixel art: the source size ("W,H")
@@ -145,6 +184,16 @@ int main(int argc, char **argv)
 		std::fprintf(stderr, "%s\n", error);
 		return 1;
 	}
+#else
+	const fg_neural_info info{ .device = device, .physical_device = physical, .width = width, .height = height, .slots = 1,
+		.source_width = getenv("FG_SOURCE") ? uint32_t(atoi(getenv("FG_SOURCE"))) : 0u,
+		.source_height = getenv("FG_SOURCE") && strchr(getenv("FG_SOURCE"), ',') ? uint32_t(atoi(strchr(getenv("FG_SOURCE"), ',') + 1)) : 0u,
+		.output_format = outputFormat, .hdr10 = getenv("FG_HDR10") && !strcmp(getenv("FG_HDR10"), "1"),
+		.get_device_proc_addr = vkGetDeviceProcAddr, .get_memory_properties = vkGetPhysicalDeviceMemoryProperties };
+	char error[256];
+	fg_neural *ctx = fg_neural_create(&info, weights.data(), weights.size(), error, sizeof(error));
+	if (!ctx) { std::fprintf(stderr, "%s\n", error); return 1; }
+#endif
 
 	const VkCommandPoolCreateInfo poolInfo{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family };
 	VkCommandPool pool;
@@ -195,7 +244,11 @@ int main(int argc, char **argv)
 		submit([&](VkCommandBuffer cmd) {
 			vkCmdResetQueryPool(cmd, timestamps, 0, 2);
 			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps, 0);
+#ifdef FG_LEGACY_CONTEXT
 			fg_record_generate(ctx, cmd, 0, FG_METHOD_NEURAL, &pair, out.view);
+#else
+			fg_neural_record(ctx, cmd, 0, &pair, out.view);
+#endif
 			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps, 1);
 		});
 		uint64_t ticks[2];
@@ -211,8 +264,24 @@ int main(int argc, char **argv)
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 		vkCmdCopyImageToBuffer(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer, 1, &region);
 	});
-	std::ofstream(argv[7], std::ios::binary).write(static_cast<const char *>(staging.mapped), std::streamsize(bytes));
+	std::ofstream(argv[7], std::ios::binary).write(static_cast<const char *>(staging.mapped), std::streamsize(outputBytes));
+#ifdef FG_LEGACY_CONTEXT
 	fg_context_destroy(ctx);
+#else
+	fg_neural_destroy(ctx);
+#endif
 	vkDeviceWaitIdle(device);
+	vkDestroyQueryPool(device, timestamps, nullptr);
+	vkDestroyCommandPool(device, pool, nullptr);
+	for (Img img : { in[0], in[1], out }) {
+		vkDestroyImageView(device, img.view, nullptr);
+		vkDestroyImage(device, img.image, nullptr);
+		vkFreeMemory(device, img.mem, nullptr);
+	}
+	vkUnmapMemory(device, staging.mem);
+	vkDestroyBuffer(device, staging.buffer, nullptr);
+	vkFreeMemory(device, staging.mem, nullptr);
+	vkDestroyDevice(device, nullptr);
+	vkDestroyInstance(instance, nullptr);
 	return 0;
 }

@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "nn_color.glsl"
 // PS5_FrameGen - neural method, step 1: a frame reduced to the network's working
 // size by averaging a grid of bilinear taps across each output pixel's footprint
 // (a box filter, as the training scenes' area averaging).
@@ -24,7 +26,7 @@ void main()
 	for (int j = 0; j < TAPS_Y; j++) {
 		for (int i = 0; i < TAPS_X; i++) {
 			const vec2 at = (vec2(p) + (vec2(i, j) + 0.5) / vec2(TAPS_X, TAPS_Y)) / vec2(params.size);
-			sum += textureLod(frame, at, 0.0).rgb;
+			sum += analysisColor(textureLod(frame, at, 0.0).rgb);
 		}
 	}
 	imageStore(result, p, vec4(sum / float(TAPS_X * TAPS_Y), 1.0));

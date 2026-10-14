@@ -67,6 +67,12 @@ void say_error(char *error, size_t size, const char *format, ...)
 
 struct fg_context {
 	VkDevice device{ VK_NULL_HANDLE };
+	fg_device_dispatch vk;
+	PFN_vkGetDeviceProcAddr get_device_proc_addr{ nullptr };
+	PFN_vkGetPhysicalDeviceMemoryProperties get_memory_properties{ nullptr };
+	VkAllocationCallbacks allocation_callbacks{};
+	const VkAllocationCallbacks *allocator{ nullptr };
+	bool hdr10{ false };
 	uint32_t width{ 0 };
 	uint32_t height{ 0 };
 	uint32_t slots{ 0 };
@@ -97,24 +103,24 @@ void fg_context_destroy(fg_context *ctx)
 	fg_splat_destroy(ctx->splat);
 	// Sets go with their pool; every handle may still be null after a failed create
 	if (ctx->pool) {
-		vkDestroyDescriptorPool(ctx->device, ctx->pool, nullptr);
+		ctx->vk.DestroyDescriptorPool(ctx->device, ctx->pool, ctx->allocator);
 	}
 	for (VkPipeline pipeline : ctx->pipelines) {
 		if (pipeline) {
-			vkDestroyPipeline(ctx->device, pipeline, nullptr);
+			ctx->vk.DestroyPipeline(ctx->device, pipeline, ctx->allocator);
 		}
 	}
 	if (ctx->pipelineLayout) {
-		vkDestroyPipelineLayout(ctx->device, ctx->pipelineLayout, nullptr);
+		ctx->vk.DestroyPipelineLayout(ctx->device, ctx->pipelineLayout, ctx->allocator);
 	}
 	if (ctx->setLayout) {
-		vkDestroyDescriptorSetLayout(ctx->device, ctx->setLayout, nullptr);
+		ctx->vk.DestroyDescriptorSetLayout(ctx->device, ctx->setLayout, ctx->allocator);
 	}
 	if (ctx->linearSampler) {
-		vkDestroySampler(ctx->device, ctx->linearSampler, nullptr);
+		ctx->vk.DestroySampler(ctx->device, ctx->linearSampler, ctx->allocator);
 	}
 	if (ctx->nearestSampler) {
-		vkDestroySampler(ctx->device, ctx->nearestSampler, nullptr);
+		ctx->vk.DestroySampler(ctx->device, ctx->nearestSampler, ctx->allocator);
 	}
 	delete ctx;
 }
@@ -132,12 +138,32 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 		say_error(error, error_size, "fg_context_create: no out pointer");
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
+	if (!info->get_device_proc_addr) {
+		say_error(error, error_size, "fg_context_create: needs get_device_proc_addr");
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
+	if (info->hdr10 && (info->source_width || info->source_height)) {
+		say_error(error, error_size, "fg_context_create: HDR10 does not support pixel art source sizes");
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
 	fg_context *ctx = new (std::nothrow) fg_context;
 	if (!ctx) {
 		say_error(error, error_size, "fg_context_create: out of host memory");
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
 	}
 	ctx->device = info->device;
+	if (const char *missing = ctx->vk.load(info->device, info->get_device_proc_addr)) {
+		say_error(error, error_size, "fg_context_create: missing %s", missing);
+		delete ctx;
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
+	ctx->get_device_proc_addr = info->get_device_proc_addr;
+	ctx->get_memory_properties = info->get_memory_properties;
+	if (info->allocator) {
+		ctx->allocation_callbacks = *info->allocator;
+		ctx->allocator = &ctx->allocation_callbacks;
+	}
+	ctx->hdr10 = info->hdr10;
 	ctx->physicalDevice = info->physical_device;
 	ctx->width = info->width;
 	ctx->source_width = info->source_width;
@@ -169,10 +195,10 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
 		.maxLod = 0.0f,
 	};
-	FG_CALL(vkCreateSampler(ctx->device, &samplerInfo, nullptr, &ctx->linearSampler));
+	FG_CALL(ctx->vk.CreateSampler(ctx->device, &samplerInfo, ctx->allocator, &ctx->linearSampler));
 	samplerInfo.magFilter = VK_FILTER_NEAREST;
 	samplerInfo.minFilter = VK_FILTER_NEAREST;
-	FG_CALL(vkCreateSampler(ctx->device, &samplerInfo, nullptr, &ctx->nearestSampler));
+	FG_CALL(ctx->vk.CreateSampler(ctx->device, &samplerInfo, ctx->allocator, &ctx->nearestSampler));
 
 	VkDescriptorSetLayoutBinding bindings[kInputBindings + 1]{};
 	for (uint32_t i = 0; i < kInputBindings; i++) {
@@ -184,7 +210,7 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 		.bindingCount = kInputBindings + 1,
 		.pBindings = bindings,
 	};
-	FG_CALL(vkCreateDescriptorSetLayout(ctx->device, &setLayoutInfo, nullptr, &ctx->setLayout));
+	FG_CALL(ctx->vk.CreateDescriptorSetLayout(ctx->device, &setLayoutInfo, ctx->allocator, &ctx->setLayout));
 
 	const VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants) };
 	const VkPipelineLayoutCreateInfo pipelineLayoutInfo{
@@ -194,7 +220,7 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 		.pushConstantRangeCount = 1,
 		.pPushConstantRanges = &pushRange,
 	};
-	FG_CALL(vkCreatePipelineLayout(ctx->device, &pipelineLayoutInfo, nullptr, &ctx->pipelineLayout));
+	FG_CALL(ctx->vk.CreatePipelineLayout(ctx->device, &pipelineLayoutInfo, ctx->allocator, &ctx->pipelineLayout));
 
 	for (uint32_t method = 0; method < FG_METHOD_COUNT; method++) {
 		if (!kMethodCode[method].words) {
@@ -206,7 +232,7 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 			.pCode = kMethodCode[method].words,
 		};
 		VkShaderModule module = VK_NULL_HANDLE;
-		FG_CALL(vkCreateShaderModule(ctx->device, &moduleInfo, nullptr, &module));
+		FG_CALL(ctx->vk.CreateShaderModule(ctx->device, &moduleInfo, ctx->allocator, &module));
 		const VkComputePipelineCreateInfo pipelineInfo{
 			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
 			.stage = {
@@ -217,8 +243,8 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 			},
 			.layout = ctx->pipelineLayout,
 		};
-		result = vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &ctx->pipelines[method]);
-		vkDestroyShaderModule(ctx->device, module, nullptr);
+		result = ctx->vk.CreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipelineInfo, ctx->allocator, &ctx->pipelines[method]);
+		ctx->vk.DestroyShaderModule(ctx->device, module, ctx->allocator);
 		FG_CALL(result);
 	}
 
@@ -233,7 +259,7 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 		.poolSizeCount = 2,
 		.pPoolSizes = poolSizes,
 	};
-	FG_CALL(vkCreateDescriptorPool(ctx->device, &poolInfo, nullptr, &ctx->pool));
+	FG_CALL(ctx->vk.CreateDescriptorPool(ctx->device, &poolInfo, ctx->allocator, &ctx->pool));
 	for (uint32_t slot = 0; slot < ctx->slots; slot++)
 	for (uint32_t r = 0; r < fg_context::kRing; r++) {
 		VkDescriptorSetLayout layouts[FG_METHOD_COUNT];
@@ -246,7 +272,7 @@ VkResult fg_context_create(const fg_create_info *info, fg_context **out, char *e
 			.descriptorSetCount = FG_METHOD_COUNT,
 			.pSetLayouts = layouts,
 		};
-		FG_CALL(vkAllocateDescriptorSets(ctx->device, &allocInfo, ctx->sets[slot][r]));
+		FG_CALL(ctx->vk.AllocateDescriptorSets(ctx->device, &allocInfo, ctx->sets[slot][r]));
 	}
 #undef FG_CALL
 	*out = ctx;
@@ -287,13 +313,13 @@ void fg_record_generate(fg_context *ctx, VkCommandBuffer cmd, uint32_t slot, fg_
 	writes[kOutputBinding] = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
 		.dstBinding = kOutputBinding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 		.pImageInfo = &imageInfos[kOutputBinding] };
-	vkUpdateDescriptorSets(ctx->device, kInputBindings + 1, writes, 0, nullptr);
+	ctx->vk.UpdateDescriptorSets(ctx->device, kInputBindings + 1, writes, 0, nullptr);
 
 	const PushConstants push{ ctx->width, ctx->height, pair->t, pair->source_width, pair->source_height };
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipelines[method]);
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipelineLayout, 0, 1, &set, 0, nullptr);
-	vkCmdPushConstants(cmd, ctx->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-	vkCmdDispatch(cmd, (ctx->width + kGroupSize - 1) / kGroupSize, (ctx->height + kGroupSize - 1) / kGroupSize, 1);
+	ctx->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipelines[method]);
+	ctx->vk.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipelineLayout, 0, 1, &set, 0, nullptr);
+	ctx->vk.CmdPushConstants(cmd, ctx->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+	ctx->vk.CmdDispatch(cmd, (ctx->width + kGroupSize - 1) / kGroupSize, (ctx->height + kGroupSize - 1) / kGroupSize, 1);
 }
 
 VkResult fg_context_load_network(fg_context *ctx, const void *blob, size_t size, char *error, size_t error_size)
@@ -302,7 +328,20 @@ VkResult fg_context_load_network(fg_context *ctx, const void *blob, size_t size,
 		say_error(error, error_size, "fg_context_load_network: needs a context made with a physical_device, and weights");
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
-	const fg_neural_info info{ ctx->device, ctx->physicalDevice, ctx->width, ctx->height, ctx->slots, ctx->source_width, ctx->source_height };
+	const fg_neural_info info{
+		.device = ctx->device,
+		.physical_device = ctx->physicalDevice,
+		.width = ctx->width,
+		.height = ctx->height,
+		.slots = ctx->slots,
+		.source_width = ctx->source_width,
+		.source_height = ctx->source_height,
+		.output_format = VK_FORMAT_R8G8B8A8_UNORM,
+		.hdr10 = ctx->hdr10,
+		.get_device_proc_addr = ctx->get_device_proc_addr,
+		.get_memory_properties = ctx->get_memory_properties,
+		.allocator = ctx->allocator,
+	};
 	fg_neural *neural = fg_neural_create(&info, blob, size, error, error_size);
 	if (!neural) {
 		return VK_ERROR_INITIALIZATION_FAILED;

@@ -74,6 +74,16 @@ struct fg_create_info {
 	   equal pixels), and the method then also finds the motion of whole source pixels (fg_frame_pair::crisp). 0: not. */
 	uint32_t source_width;
 	uint32_t source_height;
+	/* Required device entry-point loader, kept per context (no global Vulkan dispatch). */
+	PFN_vkGetDeviceProcAddr get_device_proc_addr;
+	/* Required by fg_context_load_network. */
+	PFN_vkGetPhysicalDeviceMemoryProperties get_memory_properties;
+	/* Optional host allocation callbacks for the baselines and neural method, copied on create.
+	 * pUserData must outlive the context. MVSPLAT retains its own default allocator/loader. */
+	const VkAllocationCallbacks *allocator;
+	/* Neural method only: PQ/BT.2020 colour, no pixel-art source sizes; crisp is ignored.
+	 * False preserves SDR behaviour. The context's baseline methods remain SDR RGBA8. */
+	bool hdr10;
 };
 
 struct fg_frame_pair {

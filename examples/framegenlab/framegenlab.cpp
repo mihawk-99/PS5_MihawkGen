@@ -568,6 +568,8 @@ public:
 			.height = height,
 			.slots = maxConcurrentFrames,
 			.output_format = kColorFormat,
+			.get_device_proc_addr = vkGetDeviceProcAddr,
+			.get_memory_properties = vkGetPhysicalDeviceMemoryProperties,
 		};
 		char error[256] = "";
 		if (fg_context_create(&info, &framegen, error, sizeof(error)) != VK_SUCCESS) {

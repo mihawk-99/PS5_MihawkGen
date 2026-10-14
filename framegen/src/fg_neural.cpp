@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -29,6 +30,8 @@
 #include "shaders/nn_downsample.comp.h"
 #include "shaders/nn_field.comp.h"
 #include "shaders/nn_final.comp.h"
+#include "shaders/nn_final_rgb10_a2.comp.h"
+#include "shaders/nn_final_rgba16f.comp.h"
 #include "shaders/nn_motion.comp.h"
 #include "shaders/nn_pool.comp.h"
 #include "shaders/nn_prep.comp.h"
@@ -127,6 +130,10 @@ struct SlotImages {
 
 struct fg_neural {
 	VkDevice device{ VK_NULL_HANDLE };
+	fg_device_dispatch vk;
+	VkAllocationCallbacks allocation_callbacks{};
+	const VkAllocationCallbacks *allocator{ nullptr };
+	bool hdr10{ false };
 	VkPhysicalDeviceMemoryProperties memory{};
 	uint32_t width{ 0 }, height{ 0 }, slots{ 0 };
 	uint32_t work_w{ 0 }, work_h{ 0 };
@@ -167,11 +174,11 @@ uint32_t find_memory(const VkPhysicalDeviceMemoryProperties &mem, uint32_t bits,
 	return UINT32_MAX;
 }
 
-void destroy_image(VkDevice device, Image &i)
+void destroy_image(fg_neural *n, Image &i)
 {
-	if (i.view) vkDestroyImageView(device, i.view, nullptr);
-	if (i.image) vkDestroyImage(device, i.image, nullptr);
-	if (i.memory) vkFreeMemory(device, i.memory, nullptr);
+	if (i.view) n->vk.DestroyImageView(n->device, i.view, n->allocator);
+	if (i.image) n->vk.DestroyImage(n->device, i.image, n->allocator);
+	if (i.memory) n->vk.FreeMemory(n->device, i.memory, n->allocator);
 	i = {};
 }
 
@@ -183,25 +190,25 @@ void fg_neural_destroy(fg_neural *n)
 		return;
 	}
 	VkDevice d = n->device;
-	if (n->pool) vkDestroyDescriptorPool(d, n->pool, nullptr);
-	destroy_image(d, n->tiles);
-	destroy_image(d, n->stable);
-	destroy_image(d, n->field);
+	if (n->pool) n->vk.DestroyDescriptorPool(d, n->pool, n->allocator);
+	destroy_image(n, n->tiles);
+	destroy_image(n, n->stable);
+	destroy_image(n, n->field);
 	for (SlotImages &s : n->slot) {
-		for (Image &i : s.work) destroy_image(d, i);
-		for (auto &row : s.pooled) for (Image &i : row) destroy_image(d, i);
-		for (auto &row : s.features) for (Image &i : row) destroy_image(d, i);
-		for (Image &i : s.flow) destroy_image(d, i);
-		for (Image &i : s.mask) destroy_image(d, i);
-		destroy_image(d, s.motion);
+		for (Image &i : s.work) destroy_image(n, i);
+		for (auto &row : s.pooled) for (Image &i : row) destroy_image(n, i);
+		for (auto &row : s.features) for (Image &i : row) destroy_image(n, i);
+		for (Image &i : s.flow) destroy_image(n, i);
+		for (Image &i : s.mask) destroy_image(n, i);
+		destroy_image(n, s.motion);
 	}
-	for (VkPipeline p : n->conv_pipelines) vkDestroyPipeline(d, p, nullptr);
-	for (VkPipeline p : n->pipelines) if (p) vkDestroyPipeline(d, p, nullptr);
-	for (VkPipelineLayout l : n->pipeline_layouts) if (l) vkDestroyPipelineLayout(d, l, nullptr);
-	for (VkDescriptorSetLayout l : n->set_layouts) if (l) vkDestroyDescriptorSetLayout(d, l, nullptr);
-	if (n->sampler) vkDestroySampler(d, n->sampler, nullptr);
-	if (n->weights) vkDestroyBuffer(d, n->weights, nullptr);
-	if (n->weights_memory) vkFreeMemory(d, n->weights_memory, nullptr);
+	for (VkPipeline p : n->conv_pipelines) n->vk.DestroyPipeline(d, p, n->allocator);
+	for (VkPipeline p : n->pipelines) if (p) n->vk.DestroyPipeline(d, p, n->allocator);
+	for (VkPipelineLayout l : n->pipeline_layouts) if (l) n->vk.DestroyPipelineLayout(d, l, n->allocator);
+	for (VkDescriptorSetLayout l : n->set_layouts) if (l) n->vk.DestroyDescriptorSetLayout(d, l, n->allocator);
+	if (n->sampler) n->vk.DestroySampler(d, n->sampler, n->allocator);
+	if (n->weights) n->vk.DestroyBuffer(d, n->weights, n->allocator);
+	if (n->weights_memory) n->vk.FreeMemory(d, n->weights_memory, n->allocator);
 	delete n;
 }
 
@@ -285,13 +292,50 @@ bool parse(fg_neural *n, const uint8_t *blob, size_t size, std::vector<float> &w
 } // namespace
 
 fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t size, char *error, size_t error_size)
+try
 {
+	if (!info || !info->device || !info->physical_device || !blob || !info->width || !info->height ||
+		info->width > 16384 || info->height > 16384 || !info->slots || info->slots > 8) {
+		say_error(error, error_size, "fg_neural: needs a device, physical_device, weights, valid size and 1 to 8 slots");
+		return nullptr;
+	}
+	if (!info->get_device_proc_addr || !info->get_memory_properties) {
+		say_error(error, error_size, "fg_neural: needs get_device_proc_addr and get_memory_properties");
+		return nullptr;
+	}
+	if (info->output_format != VK_FORMAT_UNDEFINED && info->output_format != VK_FORMAT_R8G8B8A8_UNORM &&
+		info->output_format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 && info->output_format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+		say_error(error, error_size, "fg_neural: unsupported output format");
+		return nullptr;
+	}
+	if (info->hdr10 && (info->source_width || info->source_height)) {
+		say_error(error, error_size, "fg_neural: HDR10 does not support pixel art source sizes");
+		return nullptr;
+	}
 	fg_neural *n = new (std::nothrow) fg_neural;
 	if (!n) {
 		say_error(error, error_size, "fg_neural: out of host memory");
 		return nullptr;
 	}
+	std::unique_ptr<fg_neural, decltype(&fg_neural_destroy)> owned(n, fg_neural_destroy);
 	n->device = info->device;
+	std::vector<float> weights;
+	if (!parse(n, static_cast<const uint8_t *>(blob), size, weights, error, error_size)) {
+		return nullptr;
+	}
+	size_t conv_count = 0;
+	for (uint32_t b = 0; b < n->block_count; b++) conv_count += n->blocks[b].layers.size();
+	// Registering a new pipeline must not allocate after Vulkan has created it.
+	n->conv_pipelines.reserve(conv_count);
+	if (const char *missing = n->vk.load(info->device, info->get_device_proc_addr)) {
+		say_error(error, error_size, "fg_neural: missing %s", missing);
+		return nullptr;
+	}
+	if (info->allocator) {
+		n->allocation_callbacks = *info->allocator;
+		n->allocator = &n->allocation_callbacks;
+	}
+	n->hdr10 = info->hdr10;
 	n->width = info->width;
 	n->height = info->height;
 	n->slots = info->slots;
@@ -302,12 +346,7 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		n->grid_w = (n->src_w + 7) / 8;
 		n->grid_h = (n->src_h + 7) / 8;
 	}
-	vkGetPhysicalDeviceMemoryProperties(info->physical_device, &n->memory);
-	std::vector<float> weights;
-	if (!parse(n, static_cast<const uint8_t *>(blob), size, weights, error, error_size)) {
-		fg_neural_destroy(n);
-		return nullptr;
-	}
+	info->get_memory_properties(info->physical_device, &n->memory);
 	const uint32_t target_h = working_height();
 	n->work_h = target_h;
 	n->work_w = std::max(64u, static_cast<uint32_t>(std::lround(double(target_h) * info->width / info->height / 16.0)) * 16);
@@ -317,7 +356,6 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		blk.h = n->work_h / blk.scale;
 		if (blk.w * blk.scale != n->work_w || blk.h * blk.scale != n->work_h) {
 			say_error(error, error_size, "fg_neural: the working size %ux%u is not a multiple of scale %u", n->work_w, n->work_h, blk.scale);
-			fg_neural_destroy(n);
 			return nullptr;
 		}
 	}
@@ -329,7 +367,6 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		result = (call);                                                                   \
 		if (result != VK_SUCCESS) {                                                        \
 			say_error(error, error_size, "fg_neural: %s returned %d", #call, static_cast<int>(result)); \
-			fg_neural_destroy(n);                                                          \
 			return nullptr;                                                                \
 		}                                                                                  \
 	} while (0)
@@ -340,9 +377,9 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		.size = weights.size() * sizeof(float),
 		.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
 	};
-	NN_CALL(vkCreateBuffer(d, &bufferInfo, nullptr, &n->weights));
+	NN_CALL(n->vk.CreateBuffer(d, &bufferInfo, n->allocator, &n->weights));
 	VkMemoryRequirements req;
-	vkGetBufferMemoryRequirements(d, n->weights, &req);
+	n->vk.GetBufferMemoryRequirements(d, n->weights, &req);
 	uint32_t type = find_memory(n->memory, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
 		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 	if (type == UINT32_MAX) {
@@ -350,16 +387,15 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 	}
 	if (type == UINT32_MAX) {
 		say_error(error, error_size, "fg_neural: no host-visible memory for the weights");
-		fg_neural_destroy(n);
 		return nullptr;
 	}
 	const VkMemoryAllocateInfo allocInfo{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type };
-	NN_CALL(vkAllocateMemory(d, &allocInfo, nullptr, &n->weights_memory));
-	NN_CALL(vkBindBufferMemory(d, n->weights, n->weights_memory, 0));
+	NN_CALL(n->vk.AllocateMemory(d, &allocInfo, n->allocator, &n->weights_memory));
+	NN_CALL(n->vk.BindBufferMemory(d, n->weights, n->weights_memory, 0));
 	void *mapped = nullptr;
-	NN_CALL(vkMapMemory(d, n->weights_memory, 0, VK_WHOLE_SIZE, 0, &mapped));
+	NN_CALL(n->vk.MapMemory(d, n->weights_memory, 0, VK_WHOLE_SIZE, 0, &mapped));
 	memcpy(mapped, weights.data(), weights.size() * sizeof(float));
-	vkUnmapMemory(d, n->weights_memory);
+	n->vk.UnmapMemory(d, n->weights_memory);
 
 	const VkSamplerCreateInfo samplerInfo{
 		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
@@ -371,7 +407,7 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
 		.maxLod = 0.0f,
 	};
-	NN_CALL(vkCreateSampler(d, &samplerInfo, nullptr, &n->sampler));
+	NN_CALL(n->vk.CreateSampler(d, &samplerInfo, n->allocator, &n->sampler));
 
 	// Descriptor layouts: S = combined image sampler, I = storage image, B = storage buffer
 	const char *shapes[kKinds] = { "SI", "SI", "SSSSI", "IIB", "ISSII", "SSSSIS", "SSI", "SSIS", "SSI", "SSSSI" };
@@ -384,41 +420,49 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 				1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 		}
 		const VkDescriptorSetLayoutCreateInfo layoutInfo{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = count, .pBindings = bindings };
-		NN_CALL(vkCreateDescriptorSetLayout(d, &layoutInfo, nullptr, &n->set_layouts[k]));
+		NN_CALL(n->vk.CreateDescriptorSetLayout(d, &layoutInfo, n->allocator, &n->set_layouts[k]));
 		const VkPushConstantRange push{ VK_SHADER_STAGE_COMPUTE_BIT, 0, push_sizes[k] };
 		const VkPipelineLayoutCreateInfo plInfo{ .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
 			.pSetLayouts = &n->set_layouts[k], .pushConstantRangeCount = 1, .pPushConstantRanges = &push };
-		NN_CALL(vkCreatePipelineLayout(d, &plInfo, nullptr, &n->pipeline_layouts[k]));
+		NN_CALL(n->vk.CreatePipelineLayout(d, &plInfo, n->allocator, &n->pipeline_layouts[k]));
 	}
 
 	struct Code { const uint32_t *words; size_t bytes; };
-	const Code code[kKinds] = { { fg_spv_nn_downsample, sizeof(fg_spv_nn_downsample) }, { fg_spv_nn_pool, sizeof(fg_spv_nn_pool) },
+	Code code[kKinds] = { { fg_spv_nn_downsample, sizeof(fg_spv_nn_downsample) }, { fg_spv_nn_pool, sizeof(fg_spv_nn_pool) },
 		{ fg_spv_nn_prep, sizeof(fg_spv_nn_prep) }, { fg_spv_nn_conv, sizeof(fg_spv_nn_conv) },
 		{ fg_spv_nn_update, sizeof(fg_spv_nn_update) }, { fg_spv_nn_final, sizeof(fg_spv_nn_final) },
 		{ fg_spv_nn_tiles, sizeof(fg_spv_nn_tiles) }, { fg_spv_nn_motion, sizeof(fg_spv_nn_motion) },
 		{ fg_spv_nn_static, sizeof(fg_spv_nn_static) }, { fg_spv_nn_field, sizeof(fg_spv_nn_field) } };
+	if (info->output_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+		code[kFinal] = { fg_spv_nn_final_rgb10_a2, sizeof(fg_spv_nn_final_rgb10_a2) };
+	} else if (info->output_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+		code[kFinal] = { fg_spv_nn_final_rgba16f, sizeof(fg_spv_nn_final_rgba16f) };
+	}
 	auto makePipeline = [&](PassKind kind, const VkSpecializationInfo *spec, VkPipeline *out) {
 		const VkShaderModuleCreateInfo moduleInfo{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = code[kind].bytes, .pCode = code[kind].words };
 		VkShaderModule module = VK_NULL_HANDLE;
-		VkResult r = vkCreateShaderModule(d, &moduleInfo, nullptr, &module);
+		VkResult r = n->vk.CreateShaderModule(d, &moduleInfo, n->allocator, &module);
 		if (r != VK_SUCCESS) return r;
 		const VkComputePipelineCreateInfo pipelineInfo{ .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
 			.stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module,
 				.pName = "main", .pSpecializationInfo = spec },
 			.layout = n->pipeline_layouts[kind] };
-		r = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, out);
-		vkDestroyShaderModule(d, module, nullptr);
+		r = n->vk.CreateComputePipelines(d, VK_NULL_HANDLE, 1, &pipelineInfo, n->allocator, out);
+		n->vk.DestroyShaderModule(d, module, n->allocator);
 		return r;
 	};
 	// The downsample's taps are specialised (unrolled): they follow from the frames' size
-	const int32_t taps[2] = {
-		int32_t(std::min(8u, std::max(1u, ceil_div(ceil_div(info->width, n->work_w), 2)))),
-		int32_t(std::min(8u, std::max(1u, ceil_div(ceil_div(info->height, n->work_h), 2)))) };
-	const VkSpecializationMapEntry tapEntries[2] = { { 0, 0, 4 }, { 1, 4, 4 } };
-	const VkSpecializationInfo tapSpec{ 2, tapEntries, sizeof(taps), taps };
+	const uint32_t taps[3] = {
+		std::min(8u, std::max(1u, ceil_div(ceil_div(info->width, n->work_w), 2))),
+		std::min(8u, std::max(1u, ceil_div(ceil_div(info->height, n->work_h), 2))),
+		info->hdr10 ? 1u : 0u };
+	const VkSpecializationMapEntry tapEntries[3] = { { 0, 0, 4 }, { 1, 4, 4 }, { 2, 8, 4 } };
+	const VkSpecializationInfo tapSpec{ 3, tapEntries, sizeof(taps), taps };
+	const VkSpecializationMapEntry hdrEntry{ 2, 0, sizeof(uint32_t) };
+	const VkSpecializationInfo hdrSpec{ 1, &hdrEntry, sizeof(uint32_t), &taps[2] };
 	for (uint32_t k = 0; k < kKinds; k++) {
 		if (k != kConv) {
-			NN_CALL(makePipeline(PassKind(k), k == kDownsample ? &tapSpec : nullptr, &n->pipelines[k]));
+			NN_CALL(makePipeline(PassKind(k), k == kDownsample ? &tapSpec : k == kFinal ? &hdrSpec : nullptr, &n->pipelines[k]));
 		}
 	}
 	// One conv pipeline for each (input groups, output groups, leaky) the network uses
@@ -450,21 +494,21 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		const VkImageCreateInfo imageInfo{ .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = kFeatureFormat,
 			.extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
 			.usage = VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0)), .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
-		VkResult r = vkCreateImage(d, &imageInfo, nullptr, &img.image);
+		VkResult r = n->vk.CreateImage(d, &imageInfo, n->allocator, &img.image);
 		if (r != VK_SUCCESS) return r;
 		VkMemoryRequirements mr;
-		vkGetImageMemoryRequirements(d, img.image, &mr);
+		n->vk.GetImageMemoryRequirements(d, img.image, &mr);
 		const uint32_t mt = find_memory(n->memory, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 		if (mt == UINT32_MAX) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 		const VkMemoryAllocateInfo ai{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt };
-		r = vkAllocateMemory(d, &ai, nullptr, &img.memory);
+		r = n->vk.AllocateMemory(d, &ai, n->allocator, &img.memory);
 		if (r != VK_SUCCESS) return r;
-		r = vkBindImageMemory(d, img.image, img.memory, 0);
+		r = n->vk.BindImageMemory(d, img.image, img.memory, 0);
 		if (r != VK_SUCCESS) return r;
 		const VkImageViewCreateInfo viewInfo{ .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img.image,
 			.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = kFeatureFormat,
 			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers } };
-		return vkCreateImageView(d, &viewInfo, nullptr, &img.view);
+		return n->vk.CreateImageView(d, &viewInfo, n->allocator, &img.view);
 	};
 
 	// The pool: every pass of every slot has one set
@@ -477,7 +521,7 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 	const VkDescriptorPoolSize sizes[] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, set_count * 6 },
 		{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, set_count * 3 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, set_count } };
 	const VkDescriptorPoolCreateInfo poolInfo{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = set_count, .poolSizeCount = 3, .pPoolSizes = sizes };
-	NN_CALL(vkCreateDescriptorPool(d, &poolInfo, nullptr, &n->pool));
+	NN_CALL(n->vk.CreateDescriptorPool(d, &poolInfo, n->allocator, &n->pool));
 
 	for (uint32_t s = 0; s < n->slots; s++) {
 		SlotImages &si = n->slot[s];
@@ -503,7 +547,7 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		auto alloc = [&](PassKind kind, VkDescriptorSet *set) -> VkResult {
 			const VkDescriptorSetAllocateInfo ai{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = n->pool,
 				.descriptorSetCount = 1, .pSetLayouts = &n->set_layouts[kind] };
-			return vkAllocateDescriptorSets(d, &ai, set);
+			return n->vk.AllocateDescriptorSets(d, &ai, set);
 		};
 		// Writes a set: S entries take a view with the sampler, I entries a view, B the weights
 		auto write = [&](VkDescriptorSet set, PassKind kind, std::initializer_list<VkImageView> views) {
@@ -523,7 +567,7 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 					writes[i].pImageInfo = &infos[i];
 				}
 			}
-			vkUpdateDescriptorSets(d, i, writes, 0, nullptr);
+			n->vk.UpdateDescriptorSets(d, i, writes, 0, nullptr);
 		};
 		auto add = [&](PassKind kind, VkPipeline pipeline, VkDescriptorSet set, uint32_t w, uint32_t h, const void *push, uint32_t push_size,
 			const std::string &label) {
@@ -587,7 +631,6 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 				VkPipeline pipeline = convPipeline(c, blk.w * blk.h, &lz);
 				if (!pipeline) {
 					say_error(error, error_size, "fg_neural: could not make a convolution pipeline");
-					fg_neural_destroy(n);
 					return nullptr;
 				}
 				const uint32_t push[4] = { blk.w, blk.h, c.weight_base, c.bias_base };
@@ -638,7 +681,12 @@ fg_neural *fg_neural_create(const fg_neural_info *info, const void *blob, size_t
 		add(kFinal, n->pipelines[kFinal], si.final_sets[0], info->width, info->height, &fp, sizeof(fp), "final " + std::to_string(info->width) + "x" + std::to_string(info->height));
 	}
 #undef NN_CALL
-	return n;
+	return owned.release();
+}
+catch (const std::bad_alloc &)
+{
+	say_error(error, error_size, "fg_neural: out of host memory");
+	return nullptr;
 }
 
 void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg_frame_pair *pair, VkImageView output)
@@ -652,12 +700,13 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 	if (!si.initialised) {
 		// The first call: every intermediate image to GENERAL, contents undefined
 		bool clear_stable = false;
-		std::vector<VkImageMemoryBarrier> barriers;
+		VkImageMemoryBarrier barriers[2 + kMaxBlocks * 6 + 4];
+		uint32_t count = 0;
 		auto add = [&](const Image &img, uint32_t layers) {
-			barriers.push_back({ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0,
+			barriers[count++] = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0,
 				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 				.newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-				.image = img.image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers } });
+				.image = img.image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers } };
 		};
 		for (const Image &i : si.work) add(i, 1);
 		for (uint32_t b = 0; b < n->block_count; b++) {
@@ -676,19 +725,19 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 			}
 			add(si.motion, 1);
 		}
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-			static_cast<uint32_t>(barriers.size()), barriers.data());
+		n->vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+			count, barriers);
 		if (clear_stable) {
 			// (the counts start at nothing)
 			const VkClearColorValue zero{};
 			const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 			VkMemoryBarrier toClear{ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
 				.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toClear, 0, nullptr, 0, nullptr);
-			vkCmdClearColorImage(cmd, n->stable.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+			n->vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toClear, 0, nullptr, 0, nullptr);
+			n->vk.CmdClearColorImage(cmd, n->stable.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
 			VkMemoryBarrier fromClear{ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fromClear, 0, nullptr, 0, nullptr);
+			n->vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fromClear, 0, nullptr, 0, nullptr);
 		}
 		si.initialised = true;
 	}
@@ -721,13 +770,16 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 	writes[count] = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = si.final_sets[ring], .dstBinding = 4, .descriptorCount = 1,
 		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &infos[count] };
 	count++;
-	vkUpdateDescriptorSets(d, count, writes, 0, nullptr);
+	n->vk.UpdateDescriptorSets(d, count, writes, 0, nullptr);
 	uint32_t crispMode = pair->crisp;
 	if (const char *force = getenv("FG_CRISP")) {
 		crispMode = uint32_t(atoi(force));   // (tests)
 	}
 	if (crispMode == 5 && !n->src_w) {
 		crispMode = 1;                        // (no motion pass to stand in for the network)
+	}
+	if (n->hdr10) {
+		crispMode = 0;                        // HDR uses the network's continuous-colour path only
 	}
 	const bool motionPass = n->src_w != 0 && crispMode != 0;
 
@@ -737,10 +789,10 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 	uint32_t index = 0;
 	if (motionPass) {
 		// the tiles found by an earlier call (another command buffer) are read here, and written here for later ones
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+		n->vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 	}
 	if (n->profile_pool) {
-		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, n->profile_pool, n->profile_base);
+		n->vk.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, n->profile_pool, n->profile_base);
 	}
 	for (Pass &p : si.passes) {
 		if ((p.kind == kTiles || p.kind == kMotion || p.kind == kStatic || p.kind == kField) && !motionPass) {
@@ -753,7 +805,7 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 			continue;                     // the motion pass alone: no network
 		}
 		if (!first) {
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+			n->vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 		}
 		first = false;
 		uint32_t push[16];
@@ -772,7 +824,7 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 				push[7] = push[8] = 0;       // no motion pass for this call: nothing to read
 			}
 		}
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+		n->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
 		VkDescriptorSet set = p.set;
 		if (p.kind == kDownsample) set = si.down_sets[ring][p.which];
 		else if (p.kind == kFinal) set = si.final_sets[ring];
@@ -780,12 +832,12 @@ void fg_neural_record(fg_neural *n, VkCommandBuffer cmd, uint32_t slot, const fg
 		else if (p.kind == kMotion) set = si.motion_sets[ring];
 		else if (p.kind == kStatic) set = si.static_sets[ring];
 		else if (p.kind == kField) set = si.field_sets[ring];
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->pipeline_layouts[p.kind], 0, 1, &set, 0, nullptr);
-		vkCmdPushConstants(cmd, n->pipeline_layouts[p.kind], VK_SHADER_STAGE_COMPUTE_BIT, 0, p.push_size, push);
-		vkCmdDispatch(cmd, p.groups_x, p.groups_y, p.groups_z);
+		n->vk.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->pipeline_layouts[p.kind], 0, 1, &set, 0, nullptr);
+		n->vk.CmdPushConstants(cmd, n->pipeline_layouts[p.kind], VK_SHADER_STAGE_COMPUTE_BIT, 0, p.push_size, push);
+		n->vk.CmdDispatch(cmd, p.groups_x, p.groups_y, p.groups_z);
 		index++;
 		if (n->profile_pool) {
-			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, n->profile_pool, n->profile_base + index);
+			n->vk.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, n->profile_pool, n->profile_base + index);
 		}
 	}
 }

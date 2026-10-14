@@ -1,4 +1,9 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "nn_color.glsl"
+#ifndef OUTPUT_FORMAT
+#define OUTPUT_FORMAT rgba8
+#endif
 // PS5_FrameGen - neural method, last step: the last block's flow and mask taken to the
 // frames' full size, both frames warped by their flows (border clamped) and blended
 // by the mask's sigmoid: out = warp(f0) m + warp(f1) (1 - m), except where the frames agree. The flow is in the
@@ -11,7 +16,7 @@ layout(binding = 0) uniform sampler2D frame0;
 layout(binding = 1) uniform sampler2D frame1;
 layout(binding = 2) uniform sampler2D flowState;
 layout(binding = 3) uniform sampler2D maskState;
-layout(binding = 4, rgba8) uniform writeonly image2D outputImage;
+layout(binding = 4, OUTPUT_FORMAT) uniform writeonly image2D outputImage;
 layout(binding = 5) uniform sampler2D motionState;   // pixel art: the displacement of each source pixel (nn_motion.comp)
 layout(push_constant) uniform Params {
 	ivec2 size;       // the frames' size
@@ -79,11 +84,13 @@ void main()
 		for (int i = -2; i <= 2; i += 2) {
 			// (sampled at the pixel centres, which the sampler returns exactly)
 			const vec2 q = (vec2(clamp(p + ivec2(i, j), ivec2(0), params.size - 1)) + 0.5) / vec2(params.size);
-			const vec3 d = abs(textureLod(frame0, q, 0.0).rgb - textureLod(frame1, q, 0.0).rgb);
+			const vec3 d = abs(analysisColor(textureLod(frame0, q, 0.0).rgb) - analysisColor(textureLod(frame1, q, 0.0).rgb));
 			difference = max(difference, max(d.r, max(d.g, d.b)));
 		}
 	}
-	float motion = smoothstep(2.0 / 255.0, 12.0 / 255.0, difference);
+	// SDR levels are unchanged. HDR thresholds are in the perceptual analysis
+	// domain, not fractions of an 8-bit PQ code (whose luminance steps vary).
+	float motion = HDR10 != 0 ? smoothstep(0.008, 0.047, difference) : smoothstep(2.0 / 255.0, 12.0 / 255.0, difference);
 	// A thing that fades or flashes in place (text that pulses, a HUD that changes colour) differs by more than the gate's
 	// levels but has not moved: its structure is the same at the same place in both frames. A normalised correlation of the
 	// two frames' brightness around the pixel (nine points, two apart) is unchanged by the fade, and high where nothing
@@ -99,8 +106,8 @@ void main()
 		for (int j = -2; j <= 2; j += 2) {
 			for (int i = -2; i <= 2; i += 2) {
 				const vec2 q = (vec2(clamp(p + ivec2(i, j), ivec2(0), params.size - 1)) + 0.5) / vec2(params.size);
-				la[n] = dot(textureLod(frame0, q, 0.0).rgb, vec3(0.299, 0.587, 0.114));
-				lc[n] = dot(textureLod(frame1, q, 0.0).rgb, vec3(0.299, 0.587, 0.114));
+				la[n] = analysisLuma(textureLod(frame0, q, 0.0).rgb);
+				lc[n] = analysisLuma(textureLod(frame1, q, 0.0).rgb);
 				ma += la[n];
 				mc += lc[n];
 				n++;
@@ -116,7 +123,8 @@ void main()
 			scc += (lc[k] - mc) * (lc[k] - mc);
 			sac += (la[k] - ma) * (lc[k] - mc);
 		}
-		const float structure = smoothstep(8.0 / 255.0, 20.0 / 255.0, sqrt(min(saa, scc) / 9.0));
+		const float deviation = sqrt(min(saa, scc) / 9.0);
+		const float structure = HDR10 != 0 ? smoothstep(0.031, 0.078, deviation) : smoothstep(8.0 / 255.0, 20.0 / 255.0, deviation);
 		const float ncc = sac * inversesqrt(max(saa * scc, 1e-8));
 		motion *= 1.0 - smoothstep(0.85, 0.97, ncc) * structure;
 	}
