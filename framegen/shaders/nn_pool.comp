@@ -1,0 +1,27 @@
+#version 450
+// PS5_FrameGen - neural method: the working-size image averaged over s x s blocks.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D source;
+layout(binding = 1, rgba16f) uniform writeonly image2D result;
+layout(push_constant) uniform Params {
+	ivec2 size;   // the result's size
+	int scale;
+} params;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, params.size))) {
+		return;
+	}
+	vec4 sum = vec4(0.0);
+	for (int j = 0; j < params.scale; j++) {
+		for (int i = 0; i < params.scale; i++) {
+			sum += texelFetch(source, p * params.scale + ivec2(i, j), 0);
+		}
+	}
+	imageStore(result, p, sum / float(params.scale * params.scale));
+}

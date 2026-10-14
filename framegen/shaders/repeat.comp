@@ -1,0 +1,33 @@
+#version 450
+// PS5_FrameGen - baseline "repeat": the previous frame, unchanged. What a
+// display shows with no generator at all; the floor every method must beat.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(uvec2(p), params.size))) {
+		return;
+	}
+	// The same size: the pixel. A larger source (a core that renders at many times the screen's size) is
+	// averaged over the pixels the output pixel covers, so the generator can work at a size it can afford.
+	// The frame is the top left part of the image when the image is padded (a texture wider than
+	// the frame's rows); source says how much.
+	const ivec2 whole = textureSize(prevColor, 0);
+	// (a core's reported size can exceed the image it hands over: never read beyond the image)
+	const ivec2 src = params.sourceWidth > 0u ? min(ivec2(params.sourceWidth, params.sourceHeight), whole) : whole;
+	const vec2 scale = vec2(src) / vec2(params.size);
+	const ivec2 n = ivec2(ceil(scale));
+	const ivec2 first = ivec2(floor(vec2(p) * scale));
+	vec4 sum = vec4(0.0);
+	for (int j = 0; j < n.y; j++) {
+		for (int i = 0; i < n.x; i++) {
+			sum += texelFetch(prevColor, min(first + ivec2(i, j), src - 1), 0);
+		}
+	}
+	imageStore(outputImage, p, sum / float(n.x * n.y));
+}

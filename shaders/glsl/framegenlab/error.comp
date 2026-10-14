@@ -1,0 +1,41 @@
+#version 450
+// FrameGen Lab - how far a generated frame is from the frame actually
+// rendered: each 16x16 group writes the sum of its pixels' squared RGB errors
+// (values 0..1) to partial[base + group]; the program adds them up in double.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout (set = 0, binding = 0) uniform sampler2D truth;
+layout (set = 0, binding = 1) uniform sampler2D tested;
+layout (set = 0, binding = 2) writeonly buffer Partial { float partial[]; };
+
+layout (push_constant) uniform Params {
+	uvec2 size;
+	uint base;
+} params;
+
+shared float sums[256];
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	float sum = 0.0;
+	if (all(lessThan(uvec2(p), params.size))) {
+		const vec3 d = texelFetch(tested, p, 0).rgb - texelFetch(truth, p, 0).rgb;
+		sum = dot(d, d);
+	}
+	sums[gl_LocalInvocationIndex] = sum;
+	barrier();
+	for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+		if (gl_LocalInvocationIndex < stride) {
+			sums[gl_LocalInvocationIndex] += sums[gl_LocalInvocationIndex + stride];
+		}
+		barrier();
+	}
+	if (gl_LocalInvocationIndex == 0u) {
+		partial[params.base + gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sums[0];
+	}
+}

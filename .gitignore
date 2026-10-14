@@ -1,0 +1,22 @@
+# The title's build, its title folder, the runs' records, the pinned SDK
+build/
+dist/
+klog/
+.deps/
+imgui.ini
+# Python bytecode
+__pycache__/
+# The training environment (docs/plan.md, phase 0); its requirements are train/requirements.txt
+.venv/
+testset/
+
+# Training runs: checkpoints and logs (train/train.py)
+train/runs/
+# The network the title ships is added once it is trained (framegen/models/network.fgw, ps5/assets.json)
+
+# Markdown stays out of the repository, except the README and the licence texts
+*.md
+!README.md
+!LICENSE.md
+!NOTICE.md
+!foundation-MIT.md

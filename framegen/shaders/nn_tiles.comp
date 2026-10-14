@@ -1,0 +1,150 @@
+#version 450
+// PS5_FrameGen - pixel art, motion of whole source pixels, first step: for each 16x16 tile of source pixels (a tile every 8
+// pixels) the displacement within +-8 pixels that makes the first frame's tile agree best with the second's. The frames are
+// the held copies, each source pixel a block of equal pixels; they are read at the blocks' centres. Pixel art matches
+// exactly, so a sample is a mismatch when any channel differs by more than 12/255 and the best displacement is the one with
+// the fewest mismatches (the smallest move when equal). Written per tile: displacement x, y, mismatch fraction at the best,
+// mismatch fraction without moving.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 64) in;
+layout(binding = 0) uniform sampler2D frame0;
+layout(binding = 1) uniform sampler2D frame1;
+layout(binding = 2, rgba16f) uniform writeonly image2D tiles;
+layout(push_constant) uniform Params {
+	ivec2 src;     // the frames' size in source pixels
+	ivec2 grid;    // the tiles' grid
+} params;
+
+const int R = 12;
+const int T = 16;
+const int STRIDE = 8;
+const int N = 2 * R + 1;
+shared uint sharedCost[64];
+shared uint sharedCand[64];
+
+vec3 fetch0(ivec2 q) { return textureLod(frame0, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0).rgb; }
+vec3 fetch1(ivec2 q) { return textureLod(frame1, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0).rgb; }
+
+// mismatches of the tile at `origin` moved by d, over the tile's pixels inside the frame; `limit`: stop counting beyond it
+uint mismatches(ivec2 origin, ivec2 d, uint limit)
+{
+	uint count = 0u;
+	for (int j = 0; j < T; j++) {
+		for (int i = 0; i < T; i++) {
+			const ivec2 p = origin + ivec2(i, j);
+			if (any(greaterThanEqual(p, params.src))) {
+				continue;
+			}
+			const ivec2 q = p + d;
+			bool bad = any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, params.src));
+			if (!bad) {
+				const vec3 diff = abs(fetch0(p) - fetch1(q));
+				bad = max(diff.r, max(diff.g, diff.b)) > 12.0 / 255.0;
+			}
+			count += bad ? 1u : 0u;
+			if (count > limit) {
+				return count;
+			}
+		}
+	}
+	return count;
+}
+
+// the same over 64 samples of the tile (every other pixel, the columns of odd rows moved by one), to find where to look
+uint coarse(ivec2 origin, ivec2 d, uint limit)
+{
+	uint count = 0u;
+	for (int j = 0; j < T; j += 2) {
+		for (int i = (j / 2) % 2; i < T; i += 2) {
+			const ivec2 p = origin + ivec2(i, j);
+			if (any(greaterThanEqual(p, params.src))) {
+				continue;
+			}
+			const ivec2 q = p + d;
+			bool bad = any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, params.src));
+			if (!bad) {
+				const vec3 diff = abs(fetch0(p) - fetch1(q));
+				bad = max(diff.r, max(diff.g, diff.b)) > 12.0 / 255.0;
+			}
+			count += bad ? 1u : 0u;
+			if (count > limit) {
+				return count;
+			}
+		}
+	}
+	return count;
+}
+
+shared uint sharedFull[16];
+
+void main()
+{
+	const ivec2 tile = ivec2(gl_WorkGroupID.xy);
+	const ivec2 origin = tile * STRIDE;
+	const uint id = gl_LocalInvocationID.x;
+	// 1. every displacement on the 64 samples
+	uint bestCost = 100000u;
+	uint bestCand = uint(R * N + R);   // no move
+	for (uint c = id; c < uint(N * N); c += 64u) {
+		const ivec2 d = ivec2(int(c) % N - R, int(c) / N - R);
+		const uint cost = coarse(origin, d, bestCost);
+		const ivec2 db = ivec2(int(bestCand) % N - R, int(bestCand) / N - R);
+		if (cost < bestCost || (cost == bestCost && abs(d.x) + abs(d.y) < abs(db.x) + abs(db.y))) {
+			bestCost = cost;
+			bestCand = c;
+		}
+	}
+	sharedCost[id] = bestCost;
+	sharedCand[id] = bestCand;
+	memoryBarrierShared();
+	barrier();
+	// 2. the best of them, and the displacements one pixel around it, on all of the tile
+	uint pick = 0u;
+	if (id == 0u) {
+		uint cost = sharedCost[0];
+		uint cand = sharedCand[0];
+		for (uint k = 1u; k < 64u; k++) {
+			const ivec2 d = ivec2(int(sharedCand[k]) % N - R, int(sharedCand[k]) / N - R);
+			const ivec2 db = ivec2(int(cand) % N - R, int(cand) / N - R);
+			if (sharedCost[k] < cost || (sharedCost[k] == cost && abs(d.x) + abs(d.y) < abs(db.x) + abs(db.y))) {
+				cost = sharedCost[k];
+				cand = sharedCand[k];
+			}
+		}
+		sharedCand[0] = cand;
+	}
+	memoryBarrierShared();
+	barrier();
+	pick = sharedCand[0];
+	const ivec2 centre = ivec2(int(pick) % N - R, int(pick) / N - R);
+	if (id < 10u) {
+		// 0..8: the nine around the pick; 9: not moving
+		ivec2 d = id < 9u ? centre + ivec2(int(id) % 3 - 1, int(id) / 3 - 1) : ivec2(0);
+		d = clamp(d, ivec2(-R), ivec2(R));
+		sharedFull[id] = mismatches(origin, d, 100000u);
+		sharedCand[id + 1u] = uint((d.y + R) * N + (d.x + R));
+	}
+	memoryBarrierShared();
+	barrier();
+	if (id == 0u) {
+		uint cost = 100000u;
+		ivec2 best = ivec2(0);
+		for (uint k = 0u; k < 10u; k++) {
+			const ivec2 d = ivec2(int(sharedCand[k + 1u]) % N - R, int(sharedCand[k + 1u]) / N - R);
+			if (sharedFull[k] < cost || (sharedFull[k] == cost && abs(d.x) + abs(d.y) < abs(best.x) + abs(best.y))) {
+				cost = sharedFull[k];
+				best = d;
+			}
+		}
+		const uint zero = sharedFull[9];
+		const ivec2 valid = min(origin + T, params.src) - origin;
+		const float pixels = float(max(1, valid.x * valid.y));
+		if (zero == 0u) {
+			imageStore(tiles, tile, vec4(0.0));
+		} else {
+			imageStore(tiles, tile, vec4(vec2(best), float(cost) / pixels, float(zero) / pixels));
+		}
+	}
+}

@@ -1,0 +1,31 @@
+Third-party notices
+
+Code kept in this repository (each keeps its own licence text beside it or in its file headers):
+
+  base/                 Sascha Willems' Vulkan example framework, MIT, Copyright (c) 2016-2026 Sascha Willems
+                        (ps5/licenses/foundation-MIT.md; the per-file copyright lines are kept)
+  external/glm          GLM, Happy Bunny License (modified MIT) and MIT, Copyright (c) 2005-2017 G-Truc Creation
+                        (external/glm/copying.txt)
+  external/imgui        Dear ImGui, MIT, Copyright (c) 2014-2018 Omar Cornut (external/imgui/LICENSE.txt)
+  external/ktx          KTX-Software, Apache-2.0, The Khronos Group Inc. and contributors
+                        (external/ktx/LICENSE.md, external/ktx/NOTICE.md)
+  external/tinygltf     TinyGLTF, MIT, Syoyo Fujita, Aurelien Chatelain and contributors (external/tinygltf/LICENSE);
+                        its json.hpp (nlohmann/json, MIT) and stb_image.h (public domain or MIT, Sean Barrett)
+                        carry their notices in the files
+  external/vulkan,
+  external/vk_video     Vulkan and Vulkan Video headers, Apache-2.0 OR MIT, Copyright 2015-2026 The Khronos Group Inc.
+                        (SPDX line in each file; ps5/licenses/Apache-2.0.txt)
+  ps5/third_party/volk  volk, MIT, Copyright (c) 2018-2026 Arseny Kapoulkine (ps5/third_party/volk/LICENSE.md)
+
+Public interpolation models. None of their code or weights is in this repository or in the shipped network. The
+trainer in train/ can use the outputs of some of them as distillation targets, and the benchmark scripts measure them:
+
+  RIFE (MIT), IFRNet (MIT), EMA-VFI (Apache-2.0), FILM (Apache-2.0), VFIMamba (Apache-2.0):
+      used as teachers, each under its own licence; credit goes to their authors.
+  GIMM-VFI, BiM-VFI, AMT: non-commercial licences; measurement references only, never used for training.
+  AMD FidelityFX SDK (FSR 3.1): run as a black box for the comparison in README.md; not shipped, not copied, not
+      trained on. Anyone repeating that comparison must follow the SDK's own licence terms. "FSR" and "FidelityFX"
+      are trademarks of Advanced Micro Devices, Inc.; this project is not affiliated with or endorsed by AMD.
+
+Trademarks: "PlayStation" and "PS5" belong to Sony Interactive Entertainment Inc.; Vulkan to the Khronos Group Inc.
+This project is not affiliated with or endorsed by either.

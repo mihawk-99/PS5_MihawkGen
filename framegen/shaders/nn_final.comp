@@ -1,0 +1,216 @@
+#version 450
+// PS5_FrameGen - neural method, last step: the last block's flow and mask taken to the
+// frames' full size, both frames warped by their flows (border clamped) and blended
+// by the mask's sigmoid: out = warp(f0) m + warp(f1) (1 - m), except where the frames agree. The flow is in the
+// working size's pixels, after the last block's own scale.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D frame0;
+layout(binding = 1) uniform sampler2D frame1;
+layout(binding = 2) uniform sampler2D flowState;
+layout(binding = 3) uniform sampler2D maskState;
+layout(binding = 4, rgba8) uniform writeonly image2D outputImage;
+layout(binding = 5) uniform sampler2D motionState;   // pixel art: the displacement of each source pixel (nn_motion.comp)
+layout(push_constant) uniform Params {
+	ivec2 size;       // the frames' size
+	vec2 working;     // the working size, in pixels
+	float scale;      // the last block's scale
+	float t;          // 0: the previous frame, 1: the next
+	int crisp;        // 1: pixel art, whole pixels only (no resampling blur)
+	int srcw;         // pixel art: the frames' size in source pixels (0: no motion pass)
+	int srch;
+} params;
+
+// A texture read with a Catmull-Rom kernel, in nine bilinear taps (the weights of the four texels in a row or a column paired
+// into one tap at their weighted centre). Bilinear reads of a frame at a fraction of a pixel low-pass it, and the two warped
+// readings averaged together lose more: a generated picture between two real ones is softer than they are, and the softness
+// pulses at the real frames' rate. The kernel keeps the frames' high frequencies where they are shifted.
+vec3 sampleSharp(sampler2D tex, vec2 uv, vec2 texSize)
+{
+	const vec2 samplePos = uv * texSize;
+	const vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+	const vec2 f = samplePos - texPos1;
+	const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+	const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+	const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+	const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+	const vec2 w12 = w1 + w2;
+	const vec2 offset12 = w2 / w12;
+	const vec2 p0 = (texPos1 - 1.0) / texSize;
+	const vec2 p3 = (texPos1 + 2.0) / texSize;
+	const vec2 p12 = (texPos1 + offset12) / texSize;
+	vec3 result = textureLod(tex, vec2(p0.x, p0.y), 0.0).rgb * w0.x * w0.y;
+	result += textureLod(tex, vec2(p12.x, p0.y), 0.0).rgb * w12.x * w0.y;
+	result += textureLod(tex, vec2(p3.x, p0.y), 0.0).rgb * w3.x * w0.y;
+	result += textureLod(tex, vec2(p0.x, p12.y), 0.0).rgb * w0.x * w12.y;
+	result += textureLod(tex, vec2(p12.x, p12.y), 0.0).rgb * w12.x * w12.y;
+	result += textureLod(tex, vec2(p3.x, p12.y), 0.0).rgb * w3.x * w12.y;
+	result += textureLod(tex, vec2(p0.x, p3.y), 0.0).rgb * w0.x * w3.y;
+	result += textureLod(tex, vec2(p12.x, p3.y), 0.0).rgb * w12.x * w3.y;
+	result += textureLod(tex, vec2(p3.x, p3.y), 0.0).rgb * w3.x * w3.y;
+	// (no sample outside the range of the four texels around the point: the kernel's negative lobes ring at an edge)
+	const ivec2 t0 = ivec2(texPos1 - 0.5);
+	const ivec2 hi = ivec2(texSize) - 1;
+	const vec3 a = texelFetch(tex, clamp(t0, ivec2(0), hi), 0).rgb;
+	const vec3 b = texelFetch(tex, clamp(t0 + ivec2(1, 0), ivec2(0), hi), 0).rgb;
+	const vec3 c = texelFetch(tex, clamp(t0 + ivec2(0, 1), ivec2(0), hi), 0).rgb;
+	const vec3 d = texelFetch(tex, clamp(t0 + ivec2(1, 1), ivec2(0), hi), 0).rgb;
+	return clamp(result, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+}
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	const bool inside = !any(greaterThanEqual(p, params.size));
+	if (!inside) {
+		return;
+	}
+	const vec2 uv = (vec2(p) + 0.5) / vec2(params.size);
+	// The gate first: where the pixel is still, nothing that follows is wanted. The frames' own blend is the picture, and the
+	// flow, the mask and the resampling are not read (the black bars of a 4:3 game, a HUD and a still background are a third
+	// or more of a picture).
+	// Where the two frames agree (within a few pixels), the network has nothing to add and its
+	// resampling only blurs: a still region must come out as the frames themselves, or it shimmers
+	// against the real frames either side of it. The blend of the two frames is exact there.
+	float difference = 0.0;
+	for (int j = -2; j <= 2; j += 2) {
+		for (int i = -2; i <= 2; i += 2) {
+			// (sampled at the pixel centres, which the sampler returns exactly)
+			const vec2 q = (vec2(clamp(p + ivec2(i, j), ivec2(0), params.size - 1)) + 0.5) / vec2(params.size);
+			const vec3 d = abs(textureLod(frame0, q, 0.0).rgb - textureLod(frame1, q, 0.0).rgb);
+			difference = max(difference, max(d.r, max(d.g, d.b)));
+		}
+	}
+	float motion = smoothstep(2.0 / 255.0, 12.0 / 255.0, difference);
+	// A thing that fades or flashes in place (text that pulses, a HUD that changes colour) differs by more than the gate's
+	// levels but has not moved: its structure is the same at the same place in both frames. A normalised correlation of the
+	// two frames' brightness around the pixel (nine points, two apart) is unchanged by the fade, and high where nothing
+	// moved by more than a few pixels. Where it is and the neighbourhood has strong structure (a standard deviation of 8 to
+	// 20 levels: text, a HUD's edges; a natural texture has less, and a slow move of it correlates too), the blend is exact
+	// and the network's warp (the background's flow carried onto the text, which doubles it) is not wanted.
+	if (motion > 0.0 && params.crisp == 0) {
+		float la[9];
+		float lc[9];
+		float ma = 0.0;
+		float mc = 0.0;
+		int n = 0;
+		for (int j = -2; j <= 2; j += 2) {
+			for (int i = -2; i <= 2; i += 2) {
+				const vec2 q = (vec2(clamp(p + ivec2(i, j), ivec2(0), params.size - 1)) + 0.5) / vec2(params.size);
+				la[n] = dot(textureLod(frame0, q, 0.0).rgb, vec3(0.299, 0.587, 0.114));
+				lc[n] = dot(textureLod(frame1, q, 0.0).rgb, vec3(0.299, 0.587, 0.114));
+				ma += la[n];
+				mc += lc[n];
+				n++;
+			}
+		}
+		ma /= 9.0;
+		mc /= 9.0;
+		float saa = 0.0;
+		float scc = 0.0;
+		float sac = 0.0;
+		for (int k = 0; k < 9; k++) {
+			saa += (la[k] - ma) * (la[k] - ma);
+			scc += (lc[k] - mc) * (lc[k] - mc);
+			sac += (la[k] - ma) * (lc[k] - mc);
+		}
+		const float structure = smoothstep(8.0 / 255.0, 20.0 / 255.0, sqrt(min(saa, scc) / 9.0));
+		const float ncc = sac * inversesqrt(max(saa * scc, 1e-8));
+		motion *= 1.0 - smoothstep(0.85, 0.97, ncc) * structure;
+	}
+	const vec3 still = mix(textureLod(frame0, uv, 0.0).rgb, textureLod(frame1, uv, 0.0).rgb, params.t);
+	if (params.crisp == 0 && motion <= 0.0) {
+		imageStore(outputImage, p, vec4(still, 1.0));
+		return;
+	}
+	// (crisp 5: the motion pass alone, with no network: no flow, and no preference for either frame)
+	const vec4 flow = params.crisp == 5 ? vec4(0.0) : textureLod(flowState, uv, 0.0) * params.scale;
+	const float m = params.crisp == 5 ? 0.5 : 1.0 / (1.0 + exp(-textureLod(maskState, uv, 0.0).x));
+	float mSteady = m;      // crisp: the mask averaged over the neighbourhood, so that one source is chosen over a region
+	vec4 c0, c1;
+	float mismatch = 0.0;   // crisp: how far the warped samples disagree anywhere around this pixel
+	if (params.crisp != 0) {
+		// Pixel art: the flow is taken to whole pixels and the frames read without filtering, so
+		// that no pixel is ever a mix of two (a blurred frame between sharp ones flickers); the
+		// mask picks one of the two frames.
+		const vec2 px = vec2(params.size) / params.working;
+		const ivec2 q0 = clamp(p + ivec2(floor(flow.xy * px + 0.5)), ivec2(0), params.size - 1);
+		const ivec2 q1 = clamp(p + ivec2(floor(flow.zw * px + 0.5)), ivec2(0), params.size - 1);
+		c0 = texelFetch(frame0, q0, 0);
+		c1 = texelFetch(frame1, q1, 0);
+		// A pixel is trusted only where the samples agree all around it: a sprite that changes its pose (not
+		// moves) agrees in places by chance and the picks tear it into pieces of both poses.
+		for (int j = -2; j <= 2; j++) {
+			for (int i = -2; i <= 2; i++) {
+				const ivec2 o = ivec2(i, j) * 3;
+				const vec3 dn = abs(texelFetch(frame0, clamp(q0 + o, ivec2(0), params.size - 1), 0).rgb
+					- texelFetch(frame1, clamp(q1 + o, ivec2(0), params.size - 1), 0).rgb);
+				mismatch = max(mismatch, max(dn.r, max(dn.g, dn.b)));
+			}
+		}
+	} else {
+		c0 = vec4(sampleSharp(frame0, uv + flow.xy / params.working, vec2(params.size)), 1.0);
+		c1 = vec4(sampleSharp(frame1, uv + flow.zw / params.working, vec2(params.size)), 1.0);
+	}
+	vec3 moved = mix(c1.rgb, c0.rgb, m);
+	if (params.crisp == 3) {
+		moved = m >= 0.5 ? c0.rgb : c1.rgb;   // (tests: the pick alone)
+	} else if (params.crisp != 0) {
+		// Where the two warped samples agree the pick is exact. Where they do not, the flow is in doubt (or the
+		// content just changes: a sprite that flickers on alternate frames, a blinking cursor) and a mix of the two
+		// would be a third picture that exists in neither frame - shown between them it flickers. The frame
+		// nearest in time is shown instead, as a repeat would, in its own place (the flow may be what is wrong).
+		const vec3 dd = abs(c0.rgb - c1.rgb);
+		if (params.srcw > 0) {
+			// Where the motion pass took a displacement, the pixel is the nearer frame moved by it (whole quarter pixels)
+			const int k = params.size.x / params.srcw;
+			const vec2 srcSize = vec2(params.srcw, params.srch);
+			vec4 mo = textureLod(motionState, (vec2(p / k) + 0.5) / srcSize, 0.0);
+			if (mo.z <= 0.5 && mo.w > 0.5 && mo.w < 1.5) {
+				// A pixel that changes and found no displacement (a sprite's new pose) takes the nearest moving pixel's within
+				// three source pixels: the sprite moves as one, the pose changes at the middle
+				for (int r = 1; r <= 3 && mo.z <= 0.5; r++) {
+					for (int j = -r; j <= r && mo.z <= 0.5; j++) {
+						for (int i = -r; i <= r; i++) {
+							if (max(abs(i), abs(j)) != r) {
+								continue;
+							}
+							const vec4 q = textureLod(motionState, (vec2(p / k + ivec2(i, j)) + 0.5) / srcSize, 0.0);
+							if (q.z > 0.5) {
+								mo = q;
+								break;
+							}
+						}
+					}
+				}
+			}
+			if (params.crisp == 9) {
+				// (tests: the motion pass's result as colour: red x, green y (+128), blue taken, alpha unused)
+				imageStore(outputImage, p, vec4((mo.x + 128.0) / 255.0, (mo.y + 128.0) / 255.0, mo.z, 1.0));
+				return;
+			}
+			if (mo.w > 1.5) {
+				// What this frame would show here is a moving thing that has left: the other frame shows what is there
+				const vec3 other = params.t <= 0.5 ? textureLod(frame1, uv, 0.0).rgb : textureLod(frame0, uv, 0.0).rgb;
+				imageStore(outputImage, p, vec4(other, 1.0));
+				return;
+			}
+			if (mo.z > 0.5) {
+				const vec2 d = mo.xy * float(k);
+				const ivec2 qa = clamp(p - ivec2(floor(params.t * d + 0.5)), ivec2(0), params.size - 1);
+				const ivec2 qc = clamp(p + ivec2(floor((1.0 - params.t) * d + 0.5)), ivec2(0), params.size - 1);
+				const vec3 shown = params.t <= 0.5
+					? textureLod(frame0, (vec2(qa) + 0.5) / vec2(params.size), 0.0).rgb
+					: textureLod(frame1, (vec2(qc) + 0.5) / vec2(params.size), 0.0).rgb;
+				imageStore(outputImage, p, vec4(shown, 1.0));
+				return;
+			}
+		}
+		const bool agree = max(params.crisp == 2 ? 0.0 : mismatch, max(dd.r, max(dd.g, dd.b))) < 12.0 / 255.0;
+		// (crisp 4, tests: where the samples disagree the nearer frame is shown moved by its flow, not in place)
+		moved = agree ? (mSteady >= 0.5 ? c0.rgb : c1.rgb) : (params.crisp == 4 ? (params.t <= 0.5 ? c0.rgb : c1.rgb) : (params.t <= 0.5 ? textureLod(frame0, uv, 0.0).rgb : textureLod(frame1, uv, 0.0).rgb));
+	}
+	imageStore(outputImage, p, vec4(mix(still, moved, motion), 1.0));
+}

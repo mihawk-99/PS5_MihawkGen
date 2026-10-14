@@ -1,0 +1,27 @@
+#version 450
+// PS5_FrameGen - pixel art, which source pixels do not change: for each source pixel, how many pairs of new frames in a row
+// it has stayed the same in (a HUD, a score, a frame around the picture). Run once for each pair of new frames. The count
+// is kept in an image between pairs; nn_motion.comp does not move such a pixel and does not take motion from one.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D frame0;
+layout(binding = 1) uniform sampler2D frame1;
+layout(binding = 2, rgba16f) uniform image2D stable;
+layout(push_constant) uniform Params {
+	ivec2 src;
+} params;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, params.src))) {
+		return;
+	}
+	const vec2 uv = (vec2(p) + 0.5) / vec2(params.src);
+	const vec3 d = abs(textureLod(frame0, uv, 0.0).rgb - textureLod(frame1, uv, 0.0).rgb);
+	const bool same = max(d.r, max(d.g, d.b)) <= 2.0 / 255.0;
+	const float count = imageLoad(stable, p).x;
+	imageStore(stable, p, vec4(same ? min(count + 1.0, 60.0) : 0.0, 0.0, 0.0, 0.0));
+}

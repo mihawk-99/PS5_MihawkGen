@@ -1,0 +1,51 @@
+#version 450
+// PS5_FrameGen - method "mvwarp": motion-compensated interpolation from the
+// next frame's backward motion vectors.
+//
+// A surface at uv u1 in the next frame was at u1 - mv(u1) in the previous
+// frame, so at time t it is at u1 - (1 - t) * mv(u1). The frame at t is made by
+// inverse warping (a gather, not a scatter, so it leaves no holes): for the
+// output pixel x, find the next-frame position u1 with u1 - (1 - t) mv(u1) = x
+// by fixed-point iteration from u1 = x (it converges where the field is
+// smooth), then read the next frame at u1 and the previous at u1 - mv(u1) and
+// mix them at t. The idea is motion-compensated frame interpolation, as in
+// FidelityFX Super Resolution 3's frame generation documentation (GPUOpen, MIT
+// SDK) and the temporal-reprojection literature; the iteration count and the
+// fallback thresholds below were set from FrameGen Lab runs (docs/design.md).
+//
+// Where the two readings disagree (an occlusion or a failed iteration), the
+// next frame's reading wins: the vectors belong to it.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+const int kIterations = 4;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(uvec2(p), params.size))) {
+		return;
+	}
+	const vec2 size = vec2(params.size);
+	const vec2 x = (vec2(p) + 0.5) / size;
+	const float forward = 1.0 - params.t;
+
+	vec2 u1 = x;
+	for (int i = 0; i < kIterations; i++) {
+		u1 = x + forward * textureLod(nextMotion, u1, 0.0).xy;
+	}
+	const vec2 mv = textureLod(nextMotion, u1, 0.0).xy;
+	const float residual = length((u1 - forward * mv - x) * size); // pixels
+	const vec2 u0 = u1 - mv;
+
+	const vec4 c1 = textureLod(nextColor, u1, 0.0);
+	const vec4 c0 = textureLod(prevColor, u0, 0.0);
+	const float disagreement = max(max(abs(c0.r - c1.r), abs(c0.g - c1.g)), abs(c0.b - c1.b));
+	const bool inside = all(greaterThanEqual(u0, vec2(0.0))) && all(lessThanEqual(u0, vec2(1.0)));
+	// 1 where the readings are not of one surface
+	const float broken = (inside ? 0.0 : 1.0) + smoothstep(1.0, 3.0, residual) + smoothstep(0.15, 0.4, disagreement);
+	imageStore(outputImage, p, mix(mix(c0, c1, params.t), c1, clamp(broken, 0.0, 1.0)));
+}

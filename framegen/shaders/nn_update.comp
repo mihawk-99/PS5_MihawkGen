@@ -1,0 +1,35 @@
+#version 450
+// PS5_FrameGen - neural method: a block's state, the previous block's upsampled (flow
+// scaled by the scales' ratio) plus the block's own output: flow (4) from layer 0 of
+// the output, the mask logit from layer 1's first channel.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform readonly image2DArray blockOutput;
+layout(binding = 1) uniform sampler2D prevFlow;
+layout(binding = 2) uniform sampler2D prevMask;
+layout(binding = 3, rgba16f) uniform writeonly image2D flowState;
+layout(binding = 4, rgba16f) uniform writeonly image2D maskState;
+layout(push_constant) uniform Params {
+	ivec2 size;
+	int first;
+	float ratio;
+} params;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, params.size))) {
+		return;
+	}
+	vec4 flow = imageLoad(blockOutput, ivec3(p, 0));
+	float mask = imageLoad(blockOutput, ivec3(p, 1)).x;
+	if (params.first == 0) {
+		const vec2 uv = (vec2(p) + 0.5) / vec2(params.size);
+		flow += textureLod(prevFlow, uv, 0.0) * params.ratio;
+		mask += textureLod(prevMask, uv, 0.0).x;
+	}
+	imageStore(flowState, p, flow);
+	imageStore(maskState, p, vec4(mask, 0.0, 0.0, 0.0));
+}

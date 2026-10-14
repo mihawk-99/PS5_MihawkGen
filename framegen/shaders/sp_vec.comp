@@ -1,0 +1,32 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 3: the displacement and depth of the surface that won each pixel (the pixels that
+// offered the winning depth write their displacement; two surfaces of one depth that differ in displacement are
+// indistinguishable by depth, and either may stay).
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 0) uniform sampler2D nextMotion;
+layout(binding = 1) uniform sampler2D nextDepth;
+layout(binding = 5, rgba16f) uniform writeonly image2D field;
+layout(binding = 6, r32ui) uniform readonly uimage2D winning;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	const vec2 d = texelFetch(nextMotion, p, 0).xy * vec2(pc.size);
+	const float depth = view_depth(texelFetch(nextDepth, p, 0).r);
+	const uint key = floatBitsToUint(depth);
+	const vec2 at = vec2(p) + 0.5 - (1.0 - pc.t) * d;
+	const ivec2 base = ivec2(floor(at - 0.5));
+	for (int o = 0; o < 4; o++) {
+		const ivec2 q = base + ivec2(o & 1, o >> 1);
+		if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, pc.size)) && imageLoad(winning, q).x == key) {
+			imageStore(field, q, vec4(d, depth, 1.0));
+		}
+	}
+}

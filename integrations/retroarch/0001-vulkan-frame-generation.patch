@@ -1,0 +1,219 @@
+--- a/gfx/drivers/vulkan.c
++++ b/gfx/drivers/vulkan.c
+@@ -28,6 +28,7 @@
+ #include <retro_miscellaneous.h>
+ #include <retro_math.h>
+ #include <string/stdstring.h>
++#include <file/file_path.h>
+ #include <libretro.h>
+ 
+ #ifdef HAVE_CONFIG_H
+@@ -45,6 +46,7 @@
+ #include "../video_driver.h"
+ 
+ #include "../common/vulkan_common.h"
++#include "vulkan_framegen.h"
+ 
+ #include "../../configuration.h"
+ #ifdef HAVE_REWIND
+@@ -154,6 +156,19 @@
+ 
+ typedef struct vk
+ {
++   /* PS5_FrameGen: the frame generator, and what the first present of a content frame shows */
++   vk_framegen_t *framegen;
++   struct vk_framegen_frame framegen_frame;
++   bool framegen_failed;
++   bool framegen_plan;           /* all the presents of the call follow */
++   bool framegen_group_open;     /* a new frame has started a group of calls */
++   unsigned framegen_subframe;   /* the present within the call, from 1 */
++   unsigned framegen_call;       /* the call within the group, from 0 */
++   unsigned framegen_period;     /* calls in a group: 1, or 2 for a game at half the core's rate */
++   unsigned framegen_last_gap;   /* the last measured gap between new frames, in calls */
++   uint8_t *framegen_last;       /* the last new software frame, to tell a repeat */
++   size_t framegen_last_bytes;
++   size_t framegen_last_pitch;
+    vulkan_filter_chain_t *filter_chain;
+    vulkan_filter_chain_t *filter_chain_default;
+    vulkan_context_t *context;
+@@ -3328,6 +3343,12 @@
+       vulkan_overlay_free(vk);
+ #endif
+ 
++      if (vk->framegen)
++         vk_framegen_free(vk->framegen);
++      vk->framegen = NULL;
++      free(vk->framegen_last);
++      vk->framegen_last = NULL;
++
+       if (vk->filter_chain)
+          vulkan_filter_chain_free((vulkan_filter_chain_t*)vk->filter_chain);
+ 
+@@ -4894,6 +4915,139 @@
+          input.format = VK_FORMAT_UNDEFINED; /* It's already configured. */
+       }
+ 
++      /* PS5_FrameGen: with N shader subframes (2 to 4) the presents of a content frame show the frames
++       * between the previous content frame and this one, and then this one. A game that runs at half the
++       * core's rate hands the driver every frame twice (or hands it nothing, when the core can duplicate
++       * frames): a content frame that is a repeat belongs to the group its new frame started, and the
++       * frames made span the whole group. With P calls in a group, the presents of the group are P * N,
++       * and the j-th shows the frame j/(P*N) of the way, the last this one. The group length P is the
++       * measured gap between new frames, taken once two gaps agree. Only when every present of the call
++       * will follow (the conditions of the subframe loop below); otherwise the history is dropped, so
++       * no frame is made across a gap. */
++      {
++         settings_t *fg_settings = config_get_ptr();
++         if (fg_settings->bools.video_framegen && !vk->framegen_failed)
++         {
++            const bool fg_nested = (vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK) != 0;
++            const unsigned fg_n  = video_info->shader_subframes;
++            const unsigned fg_j  = fg_nested ? vk->framegen_subframe : 1;
++
++            if (!fg_nested)
++            {
++               /* The first present of a call decides for all of them */
++               vk->framegen_plan =
++                     (fg_n >= 2 && fg_n <= 4)
++                  && (backbuffer->image != VK_NULL_HANDLE)
++                  && (vk->context->flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN)
++                  && !black_frame_insertion
++                  && !input_driver_nonblock_state
++                  && !runloop_is_slowmotion
++                  && !runloop_is_paused
++                  && !(vk->flags & VK_FLAG_MENU_ENABLE)
++                  && !(vk->context->swap_interval > 1);
++
++               if (!vk->framegen)
++               {
++                  char fg_path[PATH_MAX_LENGTH];
++                  const char *fg_env = getenv("PS5_FRAMEGEN_NETWORK");
++                  if (fg_env && *fg_env)
++                     strlcpy(fg_path, fg_env, sizeof(fg_path));
++                  else
++                     fill_pathname_join(fg_path, fg_settings->paths.directory_assets,
++                           "framegen/network.fgw", sizeof(fg_path));
++                  vk->framegen = vk_framegen_new(vk->context->device,
++                        vk->context->gpu, vk->context->num_swapchain_images, fg_path);
++                  if (!vk->framegen)
++                     vk->framegen_failed = true;
++               }
++
++               if (vk->framegen && vk->framegen_plan)
++               {
++                  /* Is this call a new frame? A software frame is new when its pixels differ from the last
++                   * new one; a hardware frame, when the core gave one. */
++                  bool fg_unique = frame != NULL;
++                  if (fg_unique && !(vk->flags & VK_FLAG_HW_ENABLE))
++                  {
++                     const size_t fg_bytes = (size_t)pitch * frame_height;
++                     if (   vk->framegen_last
++                         && vk->framegen_last_bytes == fg_bytes
++                         && vk->framegen_last_pitch == pitch
++                         && !memcmp(vk->framegen_last, frame, fg_bytes))
++                        fg_unique = false;
++                     else
++                     {
++                        if (vk->framegen_last_bytes != fg_bytes)
++                        {
++                           free(vk->framegen_last);
++                           vk->framegen_last = (uint8_t*)malloc(fg_bytes);
++                           vk->framegen_last_bytes = vk->framegen_last ? fg_bytes : 0;
++                        }
++                        if (vk->framegen_last)
++                           memcpy(vk->framegen_last, frame, fg_bytes);
++                        vk->framegen_last_pitch = pitch;
++                     }
++                  }
++
++                  if (fg_unique)
++                  {
++                     /* A new frame ends the group before it: how long was it? */
++                     const unsigned fg_gap = vk->framegen_call + 1;
++                     if (vk->framegen_group_open)
++                     {
++                        if (fg_gap == vk->framegen_last_gap && fg_gap >= 1 && fg_gap <= 4)
++                           vk->framegen_period = fg_gap;
++                        vk->framegen_last_gap = fg_gap;
++                        /* A group cut short never recorded its frame: nothing to interpolate from */
++                        if (vk->framegen_call + 1 < (vk->framegen_period ? vk->framegen_period : 1))
++                           vk_framegen_invalidate(vk->framegen);
++                     }
++                     vk->framegen_call       = 0;
++                     vk->framegen_group_open = true;
++                     /* A copy of the frame is held for the group's presents (the frame of this
++                      * present, outside any render pass, in the command buffer being recorded) */
++                     struct vk_framegen_frame fg_cur;
++                     fg_cur.image  = input.image;
++                     fg_cur.view   = input.view;
++                     fg_cur.layout = input.layout;
++                     fg_cur.width  = input.width;
++                     fg_cur.height = input.height;
++                     fg_cur.format = input.format;
++                     vk_framegen_hold(vk->framegen, vk->cmd, frame_index, &fg_cur);
++                  }
++                  else if (vk->framegen_group_open)
++                     vk->framegen_call++;
++               }
++               else if (vk->framegen && !vk->framegen_plan)
++               {
++                  vk_framegen_invalidate(vk->framegen);
++                  vk->framegen_group_open = false;
++               }
++            }
++
++            if (vk->framegen && vk->framegen_plan && vk->framegen_group_open)
++            {
++               /* The present's place in the group */
++               const unsigned fg_total = (vk->framegen_period ? vk->framegen_period : 1) * fg_n;
++               const unsigned fg_place = vk->framegen_call * fg_n + fg_j;
++               if (fg_place < fg_total)
++               {
++                  if (vk_framegen_generate(vk->framegen, vk->cmd, frame_index,
++                           (float)fg_place / (float)fg_total, &vk->framegen_frame))
++                  {
++                     input.image  = vk->framegen_frame.image;
++                     input.view   = vk->framegen_frame.view;
++                     input.layout = vk->framegen_frame.layout;
++                     input.width  = vk->framegen_frame.width;
++                     input.height = vk->framegen_frame.height;
++                     input.format = vk->framegen_frame.format;
++                  }
++               }
++               else if (fg_place == fg_total)
++                  vk_framegen_commit(vk->framegen);
++            }
++         }
++      }
++
+       vulkan_filter_chain_set_input_texture((vulkan_filter_chain_t*)
+             filter_chain, &input);
+    }
+@@ -5365,6 +5519,7 @@
+                (vulkan_filter_chain_t*)filter_chain, video_info->shader_subframes);
+          vulkan_filter_chain_set_current_shader_subframe(
+                (vulkan_filter_chain_t*)filter_chain, j+1);
++         vk->framegen_subframe = (unsigned)(j + 1);
+          if (!vulkan_frame(vk, NULL, 0, 0, frame_count, 0, msg,
+                   video_info))
+          {
+--- a/configuration.c
++++ b/configuration.c
+@@ -1888,6 +1888,7 @@
+    SETTING_BOOL("video_aspect_ratio_auto",       &settings->bools.video_aspect_ratio_auto, true, DEFAULT_ASPECT_RATIO_AUTO, false);
+ 
+    SETTING_BOOL("video_scan_subframes",          &settings->bools.video_scan_subframes, true, DEFAULT_SCAN_SUBFRAMES, false);
++   SETTING_BOOL("video_framegen",                &settings->bools.video_framegen, true, false, false);
+ 
+    SETTING_BOOL("video_allow_rotate",            &settings->bools.video_allow_rotate, true, DEFAULT_ALLOW_ROTATE, false);
+    SETTING_BOOL("video_windowed_fullscreen",     &settings->bools.video_windowed_fullscreen, true, DEFAULT_WINDOWED_FULLSCREEN, false);
+--- a/configuration.h
++++ b/configuration.h
+@@ -650,6 +650,7 @@
+       bool video_shader_remember_last_dir;
+       bool video_shader_preset_save_reference_enable;
+       bool video_scan_subframes;
++      bool video_framegen;
+       bool video_threaded;
+       bool video_font_enable;
+       bool video_disable_composition;

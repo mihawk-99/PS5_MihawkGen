@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// PS5_FrameGen - neural method: a 3x3 convolution, stride 1, zero padding, over feature
+// maps stored as arrays of rgba16f (four channels a layer), with a leaky ReLU (slope
+// 0.2) or none. A workgroup makes an 8x8 tile of pixels. Its LZ layers of threads share
+// the tile and split the OG output groups between them, OGS each (small images are split
+// this way, so that no thread has a long chain of multiplications to itself). The weights
+// are vec4 columns of 4x4 matrices, [og][tap][ig][j] (train/export.py), then the
+// biases; they are the same for the whole workgroup.
+//
+// Two ways to read the input, chosen at pipeline creation by the image's size:
+//  - LDS = 1: the workgroup first loads the tile and its one-pixel border into shared
+//    memory, all threads reading in turn (many loads in flight), then multiplies. Best
+//    where there are few pixels and each thread's own chain of loads would be the time.
+//  - LDS = 0: every thread reads its 3x3 neighbourhood itself. Best where there are
+//    many pixels and the caches serve the overlap.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8, local_size_z_id = 5) in;
+layout(constant_id = 0) const uint IG = 1;      // input groups
+layout(constant_id = 1) const uint OG = 1;      // output groups
+layout(constant_id = 2) const uint LEAKY = 1;
+layout(constant_id = 3) const uint OGS = 1;     // output groups a thread makes
+layout(constant_id = 4) const uint LDS = 1;
+layout(constant_id = 5) const uint LZ = 1;      // layers of threads in the workgroup: OG = LZ * OGS
+layout(binding = 0, rgba16f) uniform readonly image2DArray inputMaps;
+layout(binding = 1, rgba16f) uniform writeonly image2DArray outputMaps;
+layout(binding = 2, std430) readonly buffer Weights { vec4 w[]; };
+layout(push_constant) uniform Params {
+	ivec2 size;
+	uint weightBase;   // in vec4s
+	uint biasBase;
+} params;
+
+const uint kTile = 10;                          // 8 + the border on both sides
+shared vec4 tile[LDS != 0 ? kTile * kTile * IG : 1];
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	const uint og0 = gl_LocalInvocationID.z * OGS;
+	if (LDS != 0) {
+		const ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8 - 1;
+		for (uint i = gl_LocalInvocationIndex; i < kTile * kTile * IG; i += 64 * LZ) {
+			const uint ig = i / (kTile * kTile);
+			const uint pos = i % (kTile * kTile);
+			const ivec2 q = origin + ivec2(int(pos % kTile), int(pos / kTile));
+			const bool inside = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, params.size));
+			tile[i] = inside ? imageLoad(inputMaps, ivec3(q, int(ig))) : vec4(0.0);
+		}
+		barrier();
+	}
+	if (any(greaterThanEqual(p, params.size))) {
+		return;
+	}
+	vec4 acc[OGS];
+	[[unroll]] for (uint o = 0; o < OGS; o++) {
+		acc[o] = w[params.biasBase + og0 + o];
+	}
+	const uint centre = (gl_LocalInvocationID.y + 1) * kTile + gl_LocalInvocationID.x + 1;
+	for (uint tap = 0; tap < 9; tap++) {
+		const int dx = int(tap % 3) - 1, dy = int(tap / 3) - 1;
+		for (uint ig = 0; ig < IG; ig++) {
+			vec4 v;
+			if (LDS != 0) {
+				v = tile[ig * kTile * kTile + centre + uint(dy * int(kTile) + dx)];
+			} else {
+				const ivec2 q = p + ivec2(dx, dy);
+				const bool inside = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, params.size));
+				v = inside ? imageLoad(inputMaps, ivec3(q, int(ig))) : vec4(0.0);
+			}
+			[[unroll]] for (uint o = 0; o < OGS; o++) {
+				const uint base = params.weightBase + (((og0 + o) * 9 + tap) * IG + ig) * 4;
+				acc[o] += w[base] * v.x + w[base + 1] * v.y + w[base + 2] * v.z + w[base + 3] * v.w;
+			}
+		}
+	}
+	[[unroll]] for (uint o = 0; o < OGS; o++) {
+		vec4 r = acc[o];
+		if (LEAKY != 0) {
+			r = mix(r * 0.2, r, greaterThan(r, vec4(0.0)));
+		}
+		imageStore(outputMaps, ivec3(p, int(og0 + o)), r);
+	}
+}

@@ -1,0 +1,27 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 6 (once for each level): the sums of the pixels' colours and the count of the pixels
+// that have one, over blocks of 2x2 (alpha is the count; the colours are premultiplied).
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 0) uniform sampler2D finer;
+layout(binding = 5, rgba16f) uniform writeonly image2D coarser;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	const ivec2 inSize = textureSize(finer, 0);
+	vec4 sum = vec4(0.0);
+	for (int o = 0; o < 4; o++) {
+		const ivec2 q = p * 2 + ivec2(o & 1, o >> 1);
+		if (all(lessThan(q, inSize))) {
+			sum += texelFetch(finer, q, 0);
+		}
+	}
+	imageStore(coarser, p, sum);
+}

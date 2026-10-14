@@ -1,0 +1,42 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 7 (once for each level, coarsest first): a level's colour where its blocks have any
+// pixel with one (the average of those), else the coarser level's, bilinearly, weighting by what that has (the empty cells
+// do not darken it). Alpha 1: there is a colour. Push-pull filling of what neither frame shows.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 0) uniform sampler2D sums;
+layout(binding = 1) uniform sampler2D coarserFilled;
+layout(binding = 5, rgba16f) uniform writeonly image2D filled;
+
+vec4 from_coarser(ivec2 p)
+{
+	const ivec2 cs = textureSize(coarserFilled, 0);
+	const vec2 s = (vec2(p) + 0.5) * 0.5 - 0.5;
+	const ivec2 i0 = ivec2(floor(s));
+	const vec2 f = s - vec2(i0);
+	vec4 acc = vec4(0.0);
+	for (int o = 0; o < 4; o++) {
+		const ivec2 q = clamp(i0 + ivec2(o & 1, o >> 1), ivec2(0), cs - 1);
+		const float w = ((o & 1) != 0 ? f.x : 1.0 - f.x) * ((o >> 1) != 0 ? f.y : 1.0 - f.y);
+		const vec4 v = texelFetch(coarserFilled, q, 0);
+		acc += vec4(v.rgb * v.a, v.a) * w;
+	}
+	return acc.a > 1e-4 ? vec4(acc.rgb / acc.a, 1.0) : vec4(0.0);
+}
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	const vec4 s = texelFetch(sums, p, 0);
+	if (s.a > 0.5) {
+		imageStore(filled, p, vec4(s.rgb / s.a, 1.0));
+	} else {
+		imageStore(filled, p, pc.top != 0 ? vec4(0.0) : from_coarser(p));
+	}
+}

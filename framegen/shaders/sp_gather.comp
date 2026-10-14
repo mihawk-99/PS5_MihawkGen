@@ -1,0 +1,48 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 5: both frames are read through the field, the previous at the pixel's place minus t
+// times the displacement and the next at its place plus (1 - t) times it, and each reading counts only if the depth found
+// there is the field's (within a tolerance): a frame whose reading is of another surface has that surface covering the one
+// wanted, or the place is outside the frame. The pixels no reading is trusted for are marked (alpha 0) for the pyramid fill.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 0) uniform sampler2D prevColor;
+layout(binding = 1) uniform sampler2D nextColor;
+layout(binding = 2) uniform sampler2D prevDepth;
+layout(binding = 3) uniform sampler2D nextDepth;
+layout(binding = 4) uniform sampler2D fieldIn;
+layout(binding = 5, rgba16f) uniform writeonly image2D result;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	const vec2 size = vec2(pc.size);
+	const vec4 f = texelFetch(fieldIn, p, 0);
+	vec2 disp = vec2(0.0);
+	float depth = view_depth(texelFetch(nextDepth, p, 0).r);
+	if (f.a > 0.25) {
+		disp = f.xy;
+		depth = f.z;
+	}
+	const vec2 centre = vec2(p) + 0.5;
+	const vec2 at0 = centre - pc.t * disp;
+	const vec2 at1 = centre + (1.0 - pc.t) * disp;
+	const bool in0 = all(greaterThanEqual(at0, vec2(0.0))) && all(lessThanEqual(at0, size));
+	const bool in1 = all(greaterThanEqual(at1, vec2(0.0))) && all(lessThanEqual(at1, size));
+	const ivec2 last = pc.size - 1;
+	const float d0 = view_depth(texelFetch(prevDepth, clamp(ivec2(floor(at0)), ivec2(0), last), 0).r);
+	const float d1 = view_depth(texelFetch(nextDepth, clamp(ivec2(floor(at1)), ivec2(0), last), 0).r);
+	const float w0 = in0 && same_surface(d0, depth) ? 1.0 - pc.t : 0.0;
+	const float w1 = in1 && same_surface(d1, depth) ? pc.t : 0.0;
+	const float w = w0 + w1;
+	vec3 colour = vec3(0.0);
+	if (w > 0.0) {
+		colour = (textureLod(prevColor, at0 / size, 0.0).rgb * w0 + textureLod(nextColor, at1 / size, 0.0).rgb * w1) / w;
+	}
+	imageStore(result, p, vec4(colour, w > 0.0 ? 1.0 : 0.0));
+}

@@ -1,0 +1,75 @@
+#version 450
+// PS5_FrameGen - neural method: assembles a block's input, in channel groups of four,
+// in the order train/model.py concatenates them:
+//   block 0:  a0 (3), a1 (3), t (1), costs
+//   others:   a0 (3), a1 (3), a0 warped (3), a1 warped (3), flow (4), mask (1), t (1), costs
+// where the flow and mask are the previous block's state, upsampled and (flow) scaled by
+// the ratio of the two blocks' scales, and the costs are the matching volume
+// (cost_volume in train/model.py): for each integer displacement d within the radius, in
+// the order dy, then dx, the mean absolute difference between frame 0 at x + flow0 - t d
+// and frame 1 at x + flow1 + (1 - t) d.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D pooled0;
+layout(binding = 1) uniform sampler2D pooled1;
+layout(binding = 2) uniform sampler2D prevFlow;
+layout(binding = 3) uniform sampler2D prevMask;
+layout(binding = 4, rgba16f) uniform writeonly image2DArray features;
+layout(push_constant) uniform Params {
+	ivec2 size;
+	int first;     // 1: block 0, no previous state
+	float t;
+	float ratio;   // previous scale / this scale
+	int radius;
+} params;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, params.size))) {
+		return;
+	}
+	const vec2 size = vec2(params.size);
+	const vec2 uv = (vec2(p) + 0.5) / size;
+	const vec3 a0 = texelFetch(pooled0, p, 0).rgb;
+	const vec3 a1 = texelFetch(pooled1, p, 0).rgb;
+	vec4 flow = vec4(0.0);
+	float mask = 0.0;
+	float ch[80];
+	int n = 0;
+	ch[n++] = a0.r; ch[n++] = a0.g; ch[n++] = a0.b;
+	ch[n++] = a1.r; ch[n++] = a1.g; ch[n++] = a1.b;
+	if (params.first == 0) {
+		flow = textureLod(prevFlow, uv, 0.0) * params.ratio;
+		mask = textureLod(prevMask, uv, 0.0).x;
+		const vec3 w0 = textureLod(pooled0, uv + flow.xy / size, 0.0).rgb;
+		const vec3 w1 = textureLod(pooled1, uv + flow.zw / size, 0.0).rgb;
+		ch[n++] = w0.r; ch[n++] = w0.g; ch[n++] = w0.b;
+		ch[n++] = w1.r; ch[n++] = w1.g; ch[n++] = w1.b;
+		ch[n++] = flow.x; ch[n++] = flow.y; ch[n++] = flow.z; ch[n++] = flow.w;
+		ch[n++] = mask;
+	}
+	ch[n++] = params.t;
+	for (int dy = -params.radius; dy <= params.radius; dy++) {
+		for (int dx = -params.radius; dx <= params.radius; dx++) {
+			const vec2 d = vec2(dx, dy);
+			const vec2 f0 = flow.xy - params.t * d;
+			const vec2 f1 = flow.zw + (1.0 - params.t) * d;
+			const vec3 s0 = textureLod(pooled0, uv + f0 / size, 0.0).rgb;
+			const vec3 s1 = textureLod(pooled1, uv + f1 / size, 0.0).rgb;
+			const vec3 diff = abs(s0 - s1);
+			ch[n++] = (diff.r + diff.g + diff.b) / 3.0;
+		}
+	}
+	for (int g = 0; g * 4 < n; g++) {
+		vec4 v = vec4(0.0);
+		for (int k = 0; k < 4; k++) {
+			if (g * 4 + k < n) {
+				v[k] = ch[g * 4 + k];
+			}
+		}
+		imageStore(features, ivec3(p, g), v);
+	}
+}

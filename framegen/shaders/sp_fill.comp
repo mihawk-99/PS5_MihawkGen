@@ -1,0 +1,52 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 4 (seven times, the step 64, 32, ... 1): the pixels no surface reached take the
+// displacement and depth of the farthest surface among the eight at the pass's step (jump flooding): what is uncovered is
+// the background. A pixel a surface reached never changes. The alpha says which: 1 reached, 0.5 filled, 0 nothing.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 0) uniform sampler2D fieldIn;
+layout(binding = 5, rgba16f) uniform writeonly image2D fieldOut;
+layout(binding = 6, r32ui) uniform readonly uimage2D winning;
+
+bool reached(ivec2 q, vec4 v)
+{
+	return pc.first != 0 ? imageLoad(winning, q).x != kNoDepth : v.a > 0.75;
+}
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	const vec4 own = texelFetch(fieldIn, p, 0);
+	if (reached(p, own)) {
+		imageStore(fieldOut, p, vec4(own.xyz, 1.0));
+		return;
+	}
+	vec4 best = vec4(0.0);
+	float bestDepth = -1e30;
+	if (pc.first == 0 && own.a > 0.25) {
+		best = own;
+		bestDepth = own.z;
+	}
+	for (int i = 0; i < 9; i++) {
+		if (i == 4) {
+			continue;
+		}
+		const ivec2 q = p + (ivec2(i % 3, i / 3) - 1) * pc.step;
+		if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, pc.size))) {
+			continue;
+		}
+		const vec4 v = texelFetch(fieldIn, q, 0);
+		const bool has = pc.first != 0 ? imageLoad(winning, q).x != kNoDepth : v.a > 0.25;
+		if (has && v.z > bestDepth) {
+			bestDepth = v.z;
+			best = vec4(v.xyz, 0.5);
+		}
+	}
+	imageStore(fieldOut, p, best);
+}

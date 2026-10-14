@@ -1,0 +1,19 @@
+#version 450
+// PS5_FrameGen - baseline "blend": the two frames mixed at t, with no motion.
+// Right where nothing moves, a double image where anything does.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(uvec2(p), params.size))) {
+		return;
+	}
+	const vec4 prev = texelFetch(prevColor, p, 0);
+	const vec4 next = texelFetch(nextColor, p, 0);
+	imageStore(outputImage, p, mix(prev, next, params.t));
+}

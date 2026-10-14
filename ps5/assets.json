@@ -1,0 +1,55 @@
+{
+  "comment": "The assets FrameGen Lab ships, each with its origin and licence (ps5/tools/build-assets.py). Add each new one here, with its licence: only assets with a clear licence are shipped.",
+  "sources": {
+    "download": "files fetched at pinned SHA-256 hashes into build/ps5/downloads/: the asset pack's (SaschaWillems/Vulkan-Assets at a27c0e584434) whose licences are clear",
+    "generated": "ps5/tools/generate_assets.py: geometry and noise written there, or CC0 files it downloads (Poly Haven; Khronos's glTF-Sample-Assets at f36bfdabd1031c3cf6689a50570b8cdf3678b49c) at pinned SHA-256 hashes",
+    "file": "a file kept in this repository (ps5/assets/)"
+  },
+  "assets": [
+    {
+      "path": "Roboto-Medium.ttf",
+      "from": "download",
+      "used_by": [
+        "*"
+      ],
+      "title": "Roboto Medium",
+      "author": "Christian Robertson (Google Fonts)",
+      "licence": "Apache-2.0",
+      "url": "https://fonts.google.com/specimen/Roboto",
+      "licence_file": "licenses/Apache-2.0.txt",
+      "files": {
+        "": [
+          "https://raw.githubusercontent.com/SaschaWillems/Vulkan-Assets/a27c0e584434d59b7c7a714e9180eefca6f0ec4b/Roboto-Medium.ttf",
+          "8559132c89ad51d8a2ba5b171887a44a7ba93776e205f553573de228e64b45f8"
+        ]
+      }
+    },
+    {
+      "path": "models/ps5/lantern",
+      "from": "generated",
+      "generator": "lantern",
+      "used_by": [
+        "framegenlab"
+      ],
+      "title": "Lantern (glTF sample model)",
+      "author": "Microsoft (sbtron)",
+      "licence": "CC0-1.0",
+      "url": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Lantern",
+      "changes": "parent nodes centre it and scale it to 1.6, 5.5 and 8 tall, one .gltf for each sample"
+    },
+    {
+      "path": "framegen/network.fgw",
+      "from": "file",
+      "source": "framegen/models/network.fgw",
+      "used_by": [
+        "framegenlab"
+      ],
+      "title": "FrameGen interpolation network",
+      "author": "Mihawk (PS5_FrameGen)",
+      "licence": "GPL-3.0-or-later",
+      "url": "https://github.com/mihawk-99/PS5_FrameGen",
+      "licence_file": "../LICENSE.md",
+      "changes": "trained on this repository's own synthetic scenes (train/synth.py); no external image, video or game data"
+    }
+  ]
+}

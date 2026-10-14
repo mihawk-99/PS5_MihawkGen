@@ -1,0 +1,34 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 2: each pixel of the next frame is carried to where its surface is at the instant t
+// (its place minus (1 - t) times its displacement, the displacement being what the motion vector says it moved between the
+// two frames) and offers its depth to the four pixels nearest that place; each pixel keeps the nearest depth offered. The
+// depth-ordered scatter is the idea of forward-projected motion fields in the frame-interpolation literature and in
+// FidelityFX's frame generation documentation (GPUOpen, MIT SDK); docs/design.md has the measures.
+//
+// Depth: smaller is nearer; the key is the float's bits, which order as the floats do for depths of 0 and more.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 0) uniform sampler2D nextMotion;
+layout(binding = 1) uniform sampler2D nextDepth;
+layout(binding = 6, r32ui) uniform coherent uimage2D winning;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	const vec2 d = texelFetch(nextMotion, p, 0).xy * vec2(pc.size);
+	const uint key = floatBitsToUint(view_depth(texelFetch(nextDepth, p, 0).r));
+	const vec2 at = vec2(p) + 0.5 - (1.0 - pc.t) * d;
+	const ivec2 base = ivec2(floor(at - 0.5));
+	for (int o = 0; o < 4; o++) {
+		const ivec2 q = base + ivec2(o & 1, o >> 1);
+		if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, pc.size))) {
+			imageAtomicMin(winning, q, key);
+		}
+	}
+}

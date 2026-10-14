@@ -1,0 +1,17 @@
+#version 450
+// PS5_FrameGen - method "mvsplat", pass 1: the winning-depth image is cleared to "nothing arrived".
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+layout(binding = 6, r32ui) uniform writeonly uimage2D winning;
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, pc.size))) {
+		return;
+	}
+	imageStore(winning, p, uvec4(kNoDepth));
+}

@@ -1,0 +1,76 @@
+#version 450
+// PS5_FrameGen - pixel art, motion of whole source pixels, third step (for each picture, at its instant t): a source pixel p
+// of the picture is carried by a displacement d when the first frame's pixel at p moved back by a (a = t d rounded) is one
+// that nn_field.comp found moving by d. The candidates are the displacements the surrounding tiles found. Because the
+// pixels are asked of the same field in every picture, what one picture does with a pixel the next agrees with.
+// Written per source pixel: displacement x, y, 1 when carried; w: 1 when the pixel changes and was not carried (it may
+// take a neighbour's displacement), 2 when it was not carried and the frame it would show in place is a moving thing, which
+// has left it: the other frame shows what is there.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D tiles;
+layout(binding = 1) uniform sampler2D field;
+layout(binding = 2, rgba16f) uniform writeonly image2D motion;
+layout(binding = 3) uniform sampler2D stable;
+layout(push_constant) uniform Params {
+	ivec2 src;
+	ivec2 grid;
+	float t;
+} params;
+
+vec4 fieldAt(ivec2 q)
+{
+	return textureLod(field, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0);
+}
+
+bool still(ivec2 q)
+{
+	return textureLod(stable, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0).x >= 3.5;
+}
+
+void main()
+{
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, params.src))) {
+		return;
+	}
+	if (still(p)) {
+		imageStore(motion, p, vec4(0.0));          // (what does not change does not move)
+		return;
+	}
+	const ivec2 tile0 = p / 8;
+	ivec2 carried = ivec2(0);
+	bool isCarried = false;
+	bool second = false;    // the second frame's pixel at p is a moving thing's (for t after the middle)
+	// the candidates: the displacements the tiles around found
+	for (int j = -1; j <= 1; j++) {
+		for (int i = -1; i <= 1; i++) {
+			const ivec2 tile = clamp(tile0 + ivec2(i, j), ivec2(0), params.grid - 1);
+			const ivec2 d = ivec2(textureLod(tiles, (vec2(tile) + 0.5) / vec2(params.grid), 0.0).xy);
+			if (d == ivec2(0)) {
+				continue;
+			}
+			const ivec2 a = ivec2(floor(params.t * vec2(d) + 0.5));
+			const vec4 f = fieldAt(p - a);
+			if (f.z > 0.5 && ivec2(f.xy) == d) {
+				if (!isCarried || abs(d.x) + abs(d.y) > abs(carried.x) + abs(carried.y)) {
+					carried = d;
+					isCarried = true;
+				}
+			}
+			const vec4 g = fieldAt(p - d);
+			if (g.z > 0.5 && ivec2(g.xy) == d) {
+				second = true;
+			}
+		}
+	}
+	if (isCarried) {
+		imageStore(motion, p, vec4(vec2(carried), 1.0, 0.0));
+		return;
+	}
+	const vec4 here = fieldAt(p);
+	const bool gone = params.t <= 0.5 ? here.z > 0.5 : second;
+	imageStore(motion, p, vec4(0.0, 0.0, 0.0, gone ? 2.0 : (here.w > 0.5 ? 1.0 : 0.0)));
+}

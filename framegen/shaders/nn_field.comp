@@ -1,0 +1,80 @@
+#version 450
+// PS5_FrameGen - pixel art, motion of whole source pixels, second step (once for each pair of new frames): for each source
+// pixel of the first frame the displacement, among those the 3x3 tiles around it found, that carries it to the second
+// frame: the two frames agree over the 3x3 patch around it (A at x + q, B at x + q + d). Taken when at most one of the nine
+// samples disagrees, d is not nothing, not moving disagrees in at least three, and neither end is a pixel of a HUD.
+// It does not depend on the picture's instant, so what every picture of the pair does with a pixel agrees.
+// Written per source pixel: displacement x, y, 1 when taken, 1 when it changes.
+//
+// Copyright (C) 2026 Mihawk
+// SPDX-License-Identifier: GPL-3.0-or-later
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D frame0;
+layout(binding = 1) uniform sampler2D frame1;
+layout(binding = 2) uniform sampler2D tiles;
+layout(binding = 3) uniform sampler2D stable;
+layout(binding = 4, rgba16f) uniform writeonly image2D field;
+layout(push_constant) uniform Params {
+	ivec2 src;
+	ivec2 grid;
+} params;
+
+vec3 fetch0(ivec2 q) { return textureLod(frame0, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0).rgb; }
+vec3 fetch1(ivec2 q) { return textureLod(frame1, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0).rgb; }
+
+bool still(ivec2 q)
+{
+	return textureLod(stable, (vec2(clamp(q, ivec2(0), params.src - 1)) + 0.5) / vec2(params.src), 0.0).x >= 3.5;
+}
+
+int patchCost(ivec2 x, ivec2 d)
+{
+	int count = 0;
+	for (int j = -2; j <= 2; j++) {
+		for (int i = -2; i <= 2; i++) {
+			const ivec2 q = x + ivec2(i, j);
+			const vec3 diff = abs(fetch0(q) - fetch1(q + d));
+			count += max(diff.r, max(diff.g, diff.b)) > 12.0 / 255.0 ? 1 : 0;
+		}
+	}
+	return count;
+}
+
+void main()
+{
+	const ivec2 x = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(x, params.src))) {
+		return;
+	}
+	if (still(x)) {
+		imageStore(field, x, vec4(0.0));
+		return;
+	}
+	const int zero = patchCost(x, ivec2(0));
+	int best = zero;
+	ivec2 bestD = ivec2(0);
+	int second = 100;          // the best cost of a displacement other than the best one (a pattern that repeats has several)
+	if (zero > 0) {
+		const ivec2 tile0 = x / 8;
+		for (int j = -1; j <= 1; j++) {
+			for (int i = -1; i <= 1; i++) {
+				const ivec2 tile = clamp(tile0 + ivec2(i, j), ivec2(0), params.grid - 1);
+				const ivec2 d = ivec2(textureLod(tiles, (vec2(tile) + 0.5) / vec2(params.grid), 0.0).xy);
+				if (d == ivec2(0) || d == bestD) {
+					continue;
+				}
+				const int c = patchCost(x, d);
+				if (c < best || (c == best && abs(d.x) + abs(d.y) < abs(bestD.x) + abs(bestD.y))) {
+					second = min(second, best);
+					best = c;
+					bestD = d;
+				} else {
+					second = min(second, c);
+				}
+			}
+		}
+	}
+	// (not moving counts as an alternative: a pixel that agrees as well where it is as moved is not shown to move)
+	const bool taken = bestD != ivec2(0) && best <= 3 && zero >= 8 && second > best + 1 && !still(x + bestD);
+	imageStore(field, x, vec4(taken ? vec2(bestD) : vec2(0.0), taken ? 1.0 : 0.0, zero > 0 ? 1.0 : 0.0));
+}
